@@ -1,13 +1,16 @@
 /******************************************************************************************************/
-// AFE44XX Test Program
-// 
-// Allows User to Experiment with Settings for Pulse Oximeter AFE during runtime through terminal.
+// AFE44XX Interactive Program
 //
-// In additions this program shows how to
-//   - Startup and Configure AFE
-//   - Inspect Registers
-//   - Run Diagnostics
-//   - Read background subtracted IR and RED readings continuously
+// Allows user to experiment with settings of the pulse oximeter AFE at runtime through a
+// serial terminal (USB or BLE) command-line interface.
+//
+// This program demonstrates:
+//   - Startup and configuration of the AFE44XX
+//   - Register inspection and modification
+//   - Health checks and diagnostics
+//   - Real-time acquisition of background subtracted IR and RED readings
+//   - Saving and restoring settings (NVS preferences and RAM snapshot)
+//   - Output of data and command responses over USB serial and/or BLE serial
 //
 // The AFE functions are organized into the following groups:
 //   - Photodiode receiver settings
@@ -21,28 +24,46 @@
 //     - Averaging of readings
 //   - All other hardware options
 //
-// Urs Utzinger 2024
+// Command Interface:
+//   Type '?' for help menu listing all commands
+//   Single-letter commands control the program
+//   Commands can be followed by numbers to set parameter values
+//
+// Urs Utzinger, 2024, 2026
 /******************************************************************************************************/
 
-// Includes
-// ---------
 #include <Arduino.h>
-#include <stdlib.h> 
+#include <Preferences.h>
+#include <stdlib.h>
 #include "afe44xx.h"
 #include "logger.h"
+#include "RingBuffer.h"
+#include <BLESerial.h>
+#include <Linereader.h>
 
-// Select the  defaultlog level, you can change this at runtime also
-// #define LOG_LEVEL LOG_LEVEL_NONE 
-// #define LOG_LEVEL LOG_LEVEL_ERROR
-// #define LOG_LEVEL LOG_LEVEL_WARN 
-#define LOG_LEVEL LOG_LEVEL_INFO 
-// #define LOG_LEVEL LOG_LEVEL_DEBUG
+/******************************************************************************************************/
+// Constants
+/******************************************************************************************************/
 
-// Serial
-#define BAUD_RATE 500000  // Up to 2,000,000 on ESP32, however more than 500 kBaud might be unreliable
+// Default Log Level (can be changed at runtime)
+// LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_WARN,
+// LOG_LEVEL_ERROR, LOG_LEVEL_CRITICAL, LOG_LEVEL_NONE
+#define LOG_LEVEL LOG_LEVEL_INFO
+
+// Serial Communication
+//////////////////////////////////////////////////////////////////////////////////////////////
+constexpr unsigned long BAUDRATE         = 500'000UL;  // Up to 2,000,000 on ESP32, however more than 500 kBaud might be unreliable
+const size_t   SERIAL_OUTPUT_BUFFER_SIZE = 4096U;
+const size_t   SERIAL_LINE_BUFFER_SIZE   = 256U;
+const size_t   SERIAL_OUTPUT_CHUNK_BYTES = 64U;
+const uint32_t LOOP_INTERVAL_US          = 1000U;
+
+// BLE Serial
+//////////////////////////////////////////////////////////////////////////////////////////////
+constexpr bool useTaskPump               = true;       // set to 'false' to use polling mode
 
 // Hardware Pin Connection
-// -----------------------
+//////////////////////////////////////////////////////////////////////////////////////////////
 // Check assembly instructions for https://github.com/uutzinger/BioMedicalSensorBoard/blob/main/SPO2_Board/assembly.md
 // DRDY, CS, PWDN connection are required for this software to run.
 // If you do not want to use data ready interrupt, you can poll the data directly from the registers.
@@ -55,13 +76,21 @@
 #define DIAGEND_PIN  27  // This can be used to wait until diagnosis is finished, but it is usually not necessary
 #define PWDN_PIN     25  // power down pin, active low, you can hardwire for always on and turn off LED, Photodiode and other hardware with software
 
-// AFE Global Configuration Variables
-// ----------------------------------
+/******************************************************************************************************/
+// Global Configuration Variables
+/******************************************************************************************************/
+
+// AFE
+//////////////////////////////////////////////////////////////////////////////////////////////
 // these are needed for interactive user programming during runtime
 /* Diagnostics */
 uint32_t afe44xx_diag_status;         // holds results of the diagnosis function
 /* Report data */
-bool    afe44xx_reporting    = false; // continously report IR and red measurements on serial port
+bool    data_reporting       = false; // continuously report IR and red measurements
+const uint8_t DATA_OUT_SERIAL = 0x01U;
+const uint8_t DATA_OUT_BLE    = 0x02U;
+const uint8_t DATA_OUT_ALL    = DATA_OUT_SERIAL | DATA_OUT_BLE;
+uint8_t data_output_mask      = DATA_OUT_SERIAL;  // where continuous data is sent
 /* Receiver Stage  */
 bool    afe44xx_sameGain     = true;  // same gain and feddback ressistor/capacitor for LED1 and LED2
 int8_t  afe44xx_stage2Gain1  = 0;     // stage 2 gain for LED1: -1 disable, 0=1, 1=1.5, 2=2, 2=3, 4=4
@@ -113,18 +142,40 @@ bool    afe44xx_running      = false; // keep track if system is running
 bool    afe44xx_shortDiag    = true;  // short diagnostic 8ms or long diagnostics 16ms
 bool    afe44xx_useXTAL      = true;  // use external crystal, otherwise provide clock signal, usual design is with crystal
 
+// Persistence
+//////////////////////////////////////////////////////////////////////////////////////////////
+// The AFE44XX registers are volatile and are lost at power down or reset. The sketch globals above
+// are the source of truth: they are written to the registers by setup() and by applySettings().
+// - NVS preferences (Ps, Pl, Pd, Pc) keep these globals across reboot, they are loaded at boot.
+// - RAM snapshot ( "(" and ")" ) keeps a copy of these globals until reboot.
+const uint16_t AFE_PREF_SCHEMA_VERSION = 1U;
+const char     AFE_PREF_NAMESPACE[]    = "afe44xx";
+
+struct AfeSettings {
+  bool    sameGain;
+  int8_t  stage2Gain1, stage2Gain2;
+  int16_t CF1, CF2, RF1, RF2;
+  uint8_t Fc, CAmbient;
+  uint8_t txRefVoltage, range, led1Power, led2Power;
+  bool    tristate, hbridge, bypassADC, powerRX, powerTX, powerAFE, shortDiag, useXTAL;
+  uint8_t alarmpins, numAverage;
+  float   factor;
+};
+AfeSettings afe44xx_snapshot;
+bool        afe44xx_snapshot_valid = false;
+
 // Program Globals
-uint32_t   currentTime;                                               // Populated at beginning of main loop
-uint32_t   lastTime;                                                  // to compute sampling frequency
-float      samplingRate;                                              // computed in main loop
-char       serialInputBuff[64];                                       // general text buffer
-bool       serialCommandComplete = false;                             // keep track of serial input until we receive CR
-const char waitmsg[] = {"Waiting 5 seconds, skip by sending enter"};  // Allows user to open serial terminal to observe the debug output before the loop starts
-extern int currentLogLevel;                                           // log level when using the logger.cpp provided logging functions
-char       tmpStr[256];                                               // general string buffer
+//////////////////////////////////////////////////////////////////////////////////////////////
+uint32_t      currentTime;                                                  // populated at beginning of main loop
+uint32_t      lastTime;                                                     // to compute sampling frequency
+float         samplingRate;                                                 // computed in main loop
+uint32_t      sample_count = 0UL;                                           // number of samples read since start or reset
+char          tmpStr[256];                                                  // general string buffer
+const char    waitmsg[] = {"Waiting for serial terminal (5 seconds, press Enter to skip)"};
+extern int    currentLogLevel;                                              // log level when using the logger.cpp provided logging functions
 
 // Data retrieved from the AFE
-// ---------------------------
+//////////////////////////////////////////////////////////////////////////////////////////////
 int32_t irRawValue = 0;      // raw value for IR LED data
 int32_t redRawValue = 0;     // raw value for Red LED data
 int32_t irAmbientValue = 0;  // Background reading for IR LED
@@ -132,9 +183,58 @@ int32_t redAmbientValue = 0; // Background reading for Red LED
 int32_t irValue = 0;         // IR data, background subtracted by AFE
 int32_t redValue = 0;        // Red data, background subtracted by AFE
 
+// Serial buffer
+//////////////////////////////////////////////////////////////////////////////////////////////
+//  output buffers for chunking
+//  input buffers for command line input
+RingBuffer<char, SERIAL_OUTPUT_BUFFER_SIZE> serial_output_buff;
+RingBuffer<char, SERIAL_OUTPUT_BUFFER_SIZE> ble_output_buff;
+char          serial_input_buff[128];                // buffer for incoming serial data
+// Temporary buffer for continuous data line reporting,
+//   drains to serial and BLE output buffers
+char          serial_line_buff[SERIAL_LINE_BUFFER_SIZE];
+size_t        serial_line_len = 0U;
+
+enum class CommandSource : uint8_t {
+  UsbSerial,
+  Ble
+};
+
+CommandSource active_command_source = CommandSource::UsbSerial;
+
+// BLE Serial
+//////////////////////////////////////////////////////////////////////////////////////////////
+BLESerial     ble;
+char          ble_input_buff[128];
+
+// Line Reader for command input
+//////////////////////////////////////////////////////////////////////////////////////////////
+LineReader<128>         ble_lr;
+LineReader<128>         serial_lr;
+
 // Instantiate the device driver
-// -----------------------------
+//////////////////////////////////////////////////////////////////////////////////////////////
 AFE44XX afe44xx(CS_PIN, PWDN_PIN, DRDY_PIN);
+
+// Function declarations
+//////////////////////////////////////////////////////////////////////////////////////////////
+void processCommand(const char* input_buff, CommandSource source);
+void handleGeneralCommand(char cmd);
+void handleParameterCommand(const char* command);
+void serialTrigger(const char* mess, int timeout);
+void applySettings();
+void helpMenu();
+void showSettings();
+void printPreferencesProfile();
+bool savePreferencesProfile();
+bool loadPreferencesProfile(bool report);
+bool clearPreferencesProfile();
+void captureSettings(AfeSettings &c);
+void restoreSettings(const AfeSettings &c);
+bool serialBufferWriteChar(char c);
+bool serialBufferWrite(const char* text);
+bool serialBufferWriteLine();
+void serialOutUpdate(size_t max_bytes = SERIAL_OUTPUT_CHUNK_BYTES);
 
 /******************************************************************************************************/
 // Setup
@@ -144,16 +244,35 @@ void setup() {
 
   // Initialize globals
   // ------------------
-  currentLogLevel = LOG_LEVEL;
+  logSetLevel(LOG_LEVEL);
   afe44xx_diag_status = 0;
 
   // Serial
   // ------
-  Serial.begin(BAUD_RATE);      // setup serial
-  Serial.setTimeout(1000);      // default is 1000 
+  Serial.begin(BAUDRATE);       // setup serial
+  Serial.setTimeout(1000);      // default is 1000
   serialTrigger(waitmsg, 5000); // give user time to open serial terminal
-  
+
   LOGI("Starting");
+
+  // Restore saved settings from NVS, if any
+  loadPreferencesProfile(false);
+
+  // BLE Serial
+  // ----------
+  ble.setPumpMode(useTaskPump ? BLESerial::PumpMode::Task : BLESerial::PumpMode::Polling);
+
+  if (!ble.begin(
+        BLESerial::Mode::Fast,        /*Fast, LowPower, LongRange, Balanced*/
+        "BLESerialDevice",            /*Name*/
+        BLESerial::Security::None     /*None, JustWorks, PasskeyDisplay*/
+       )
+     )  {
+    LOGE("BLESerial begin() failed");
+    while (true) delay(1000);
+  }
+
+  ble.setLogLevel(LOG_LEVEL);
 
   // AFE
   // ------
@@ -235,18 +354,20 @@ void setup() {
   LOGI("  LED:       %s", ledAlarmStatus ? "HIGH" : "LOW");
   LOGI("  Diag Ends: %s",  diagEndStatus ? "HIGH" : "LOW");
 
-  // Clear the serial input buffer
-  while (Serial.available()) { Serial.read(); }
-
-  LOGI("Setup complete, AFE started"); 
+  LOGI("Setup complete, AFE started");
 
   lastTime = micros();
   samplingRate = 500.*afe44xx_factor/float(afe44xx_numAverage);
 
+  LOGln("");
+  LOGln("AFE44XX Interactive Program Starting");
+  LOGln("======================================");
+  LOGln("Ready for commands. Type '?' for help.");
+  LOGln("");
 }
 
 /******************************************************************************************************/
-// Loop
+// Main Loop
 /******************************************************************************************************/
 
 void loop() {
@@ -254,127 +375,669 @@ void loop() {
   currentTime = micros();                                   // keep track of loop time
 
   // Obtain new data with ISR
+  // =======================================================
   if (afe44xx.afe44xx_data_ready) {
     afe44xx.getData(irRawValue, redRawValue, irAmbientValue, redAmbientValue, irValue, redValue);
+    sample_count++;
     samplingRate = 0.9*samplingRate + 100000./float(currentTime-lastTime); // low pass filtered sampling rate
     lastTime = currentTime;
-    if (afe44xx_reporting) {
-      snprintf(tmpStr, sizeof(tmpStr), "IR: %9i\tRed: %9i\tIR_a: %i\tRed_a: %9i\t S\\s: %.1f", irValue, redValue, irAmbientValue, redAmbientValue, samplingRate); Serial.println(tmpStr);
+    if (data_reporting) {
+      snprintf(tmpStr, sizeof(tmpStr), "IR: %9ld\tRed: %9ld\tIR_a: %9ld\tRed_a: %9ld\tS/s: %.1f",
+               (long)irValue, (long)redValue, (long)irAmbientValue, (long)redAmbientValue, samplingRate);
+      serialBufferWrite(tmpStr);
+      serialBufferWriteLine();
     }
   }
 
-  // Check for user serial input
-  static size_t index = 0;
-  while (Serial.available() && !serialCommandComplete) {
-    char c = Serial.read();
-    if (c == '\n') {  // End of line character received
-      serialInputBuff[index] = '\0'; // Null-terminate the string
-      serialCommandComplete = true;
-      index = 0; // Reset index for next message
-    } else if (c != '\r') {
-      // Only store the character if it's not a carriage return
-      if (index < sizeof(serialInputBuff) - 1) {
-        serialInputBuff[index++] = c;
-      } else {
-        // Prevent buffer overflow by not incrementing index
-        // This will overwrite the last character repeatedly
-        serialInputBuff[index] = c;
-      }
-    }
+  // BLE Serial Update
+  // =======================================================
+  if (!useTaskPump) {
+    ble.update(); // polling pump
   }
 
-  // Process the serial input
-  if (serialCommandComplete) {
-      inputHandle();
-      serialCommandComplete = false;
+  // Command Receiver (String)
+  // =======================================================
+  if (ble_lr.poll(ble, ble_input_buff, sizeof(ble_input_buff))) {
+    logSetOutput(ble);
+    processCommand(ble_input_buff, CommandSource::Ble);
   }
 
-  // delay per sample in milli seconds: 1000ms/sec * 1sec/(500.*factor/numAverage)
-  delay(1); // give some free processor time, if you increase timing to above 1000 samples per second, this delay should be 0
+  if (serial_lr.poll(Serial, serial_input_buff, sizeof(serial_input_buff))) {
+    logSetOutput(Serial);
+    processCommand(serial_input_buff, CommandSource::UsbSerial);
+  }
+
+  // Send data in chunks over serial to avoid blocking
+  // =======================================================
+  serialOutUpdate();
+
+  // Small delay, to maintain loop timing and prevent overwhelming the system
+  // ===========
+  const uint32_t elapsed_us = micros() - currentTime;
+  if (elapsed_us < LOOP_INTERVAL_US) {
+    delayMicroseconds(static_cast<unsigned int>(LOOP_INTERVAL_US - elapsed_us));
+  }
 }
 
 /******************************************************************************************************/
 // Support functions
 //
-// These functions are used to allow runtime configuration of the AFE44XX through user input
-// Single letters are used for commands
-// Upper case commands indicate the command category and are followed by the function letter and optional number
-// Lower case commands are single letter commands that can be followed by a number
+// These functions are used to allow runtime configuration of the AFE44XX through user input.
+// Single letters are used for general commands.
+// Upper case commands indicate the command category and are followed by the function letter and optional number.
+// Lower case commands with a number are z (data output) and l (log level).
 /******************************************************************************************************/
 
-// Boot helper
-// Prints message and wait until timeout or user sends a character on the serial terminal
+// Boot helper - prints message and waits until timeout or user input
 void serialTrigger(const char* mess, int timeout) {
   uint32_t startTime = millis();
-  Serial.println(); Serial.println(mess);
-  while ( !Serial.available() && ( (millis() - startTime) < timeout ) ) {
+  LOGln("");
+  LOGln("%s", mess);
+  while (!Serial.available() && ((millis() - startTime) < timeout)) {
     delay(500);
   }
   // Clear the serial input buffer
   while (Serial.available()) { Serial.read(); }
 }
 
-// Present this text to the users if they type '?'
-void helpMenu() {
-  Serial.println("================================================================================");
-  Serial.println("| AFE4490 Texas Instruments Analog Front End for Clinical 2CH Pulse Oximeter   |");  
-  Serial.println("| 2024 Urs Utzinger                                                            |");
-  Serial.println("================================================================================");
-  Serial.println("| ?: help screen                        | r: dump registers                    |");
-  Serial.println("| z: print sensor data                  | t: timing factor t1.0                |");
-  Serial.println("| d: run diagnostics                    | p: alarm pins p0                     |");
-  Serial.println("| a: apply settings                     | s: show settings                     |");
-  Serial.println("| .: toggle start/stop DAQ              | e: show timers                       |");
-  Serial.println("| m: set averages               m4      |                                      |");
-  Serial.println("==Receiver==============================|==Transmitter==========================");
-  Serial.println("| Rg1: stage2 gain LED1,        Rg1-1   | TV:  ref voltage level, TV0          |");
-  Serial.println("| Rg2: stage2 gain LED2,        Rg23    | TC:  current range,     TC0          |");
-  Serial.println("| RC1: feedback capacitor LED1, RC15    |======================================|");
-  Serial.println("| RR1: feedback resistor LED1,  RR1200  | LP1: power level LED 1, LP1255       |");
-  Serial.println("| RFC: filter edge frequency,   RFC0    | LP2: power level LED 2, LP2255       |");
-  Serial.println("| RFB: ambient Current,         RFB1    |======================================|");
-  Serial.println("| RC2: feedback capacitor LED2, RC25    |                                      |");
-  Serial.println("| RR2: feedback resistor LED2,   RR2200 |                                      |");
-  Serial.println("==Toggle================================|==Toggle===============================");
-  Serial.println("| x: 1 sameGain LED1&2 on/off   x1      | x: 5 RX on/off          x5           |");
-  Serial.println("| x: 2 tri state on/off         x2      | x: 6 TX on/off          x6           |");
-  Serial.println("| x: 3 h bridge on/off          x3      | x: 7 AFE on/off         x7           |");
-  Serial.println("| x: 4 bypass ADC on/off        x4      |                                      |");
-  Serial.println("==Debug Level===========================|==Debug Level==========================");
-  Serial.println("| l: 0 none                     l0      |                                      |");
-  Serial.println("| l: 1 errors only              l1      |                                      |");
-  Serial.println("| l: 2 warnings                 l2      |                                      |");
-  Serial.println("| l: 3 info                     l3      |                                      |");
-  Serial.println("| l: 4 debug                    l4      | l: 99 continuous data reporting      |");
-  Serial.println("================================================================================");
+// Serial Output (Ring Buffer)
+//////////////////////////////////////////////////////////////////////////////////////////////
+// These are used to queue data for serial output, so that the main loop can
+// continue processing data without blocking on Serial.write().
+
+bool serialBufferWriteChar(char c) {
+  if (serial_line_len >= sizeof(serial_line_buff)) {
+    return false;
+  }
+  serial_line_buff[serial_line_len++] = c;
+  return true;
 }
 
-// Function to handle the input
-//   - Lower case commands are single letter commands that can be followed by a number
-//   - Upper case commands have sub commands and can be followed by a number
-void inputHandle() {
-  // Check if the input is empty
-  if (serialInputBuff[0] == '\0') return;
-  char command = serialInputBuff[0];
-  if (isupper(command)) {
-      handleUppercaseCommand(serialInputBuff);
-  } else if (islower(command) || command == '?' || command == '.') {
-      handleLowercaseCommand(serialInputBuff);
-  } else {
-      Serial.println("Unknown command");
+bool serialBufferWrite(const char* text) {
+  if (text == nullptr) {
+    return true;
+  }
+  bool ok = true;
+  while (*text != '\0') {
+    ok = serialBufferWriteChar(*text++) && ok;
+  }
+  return ok;
+}
+
+bool serialBufferWriteLine() {
+  bool ok = serialBufferWriteChar('\r');
+  ok = serialBufferWriteChar('\n') && ok;
+  if ((data_output_mask & DATA_OUT_SERIAL) != 0U) {
+    ok = (serial_output_buff.push(serial_line_buff, serial_line_len) == serial_line_len) && ok;
+  }
+  // Copy data to the BLE output buffer only when a client is subscribed.
+  // drainBleDataOutput() handles writeReady() flow control.
+  if ((data_output_mask & DATA_OUT_BLE) != 0U && ble.isSubscribed()) {
+    ok = (ble_output_buff.push(serial_line_buff, serial_line_len) == serial_line_len) && ok;
+  }
+  serial_line_len = 0U;
+  return ok;
+}
+
+size_t drainSerialDataOutput(size_t max_bytes) {
+  size_t sent = 0U;
+  while (sent < max_bytes && serial_output_buff.available() > 0) {
+    if (Serial.availableForWrite() <= 0) {
+      break;
+    }
+
+    char c = '\0';
+    if (serial_output_buff.peek(c) != 1U) {
+      break;
+    }
+    if (Serial.write(static_cast<uint8_t>(c)) != 1U) {
+      break;
+    }
+    serial_output_buff.consume();
+    sent++;
+  }
+  return sent;
+}
+
+size_t drainBleDataOutput(size_t max_bytes) {
+  if (!ble.isSubscribed()) {
+    ble_output_buff.clear();
+    return 0U;
+  }
+  if (!ble.writeReady()) {
+    return 0U;
+  }
+
+  size_t sent = 0U;
+  while (sent < max_bytes && ble_output_buff.available() > 0) {
+    if (!ble.writeReady()) {
+      break;
+    }
+
+    char c = '\0';
+    if (ble_output_buff.peek(c) != 1U) {
+      break;
+    }
+    if (ble.write(static_cast<uint8_t>(c)) != 1U) {
+      break;
+    }
+    ble_output_buff.consume();
+    sent++;
+  }
+  return sent;
+}
+
+// Write buffered data to enabled outputs in chunks.
+void serialOutUpdate(size_t max_bytes) {
+  if ((data_output_mask & DATA_OUT_SERIAL) != 0U) {
+    drainSerialDataOutput(max_bytes);
+  } else if (serial_output_buff.available() > 0) {
+    serial_output_buff.clear();
+  }
+
+  if ((data_output_mask & DATA_OUT_BLE) != 0U) {
+    drainBleDataOutput(max_bytes);
+  } else if (ble_output_buff.available() > 0) {
+    ble_output_buff.clear();
   }
 }
 
-// Process Upper Case Commands with subcommands
-void handleUppercaseCommand(const char* command) {
+void printDataOutputSettings() {
+  LOG("Continuous data display: ");
+  LOG("%s", data_reporting ? "ON" : "OFF");
+  LOG(" | USB: ");
+  LOG("%s", (data_output_mask & DATA_OUT_SERIAL) ? "ON" : "OFF");
+  LOG(" | BLE: ");
+  LOGln("%s", (data_output_mask & DATA_OUT_BLE) ? "ON" : "OFF");
+}
+
+// Persistence functions
+//////////////////////////////////////////////////////////////////////////////////////////////
+
+// Copy current settings globals into a struct
+void captureSettings(AfeSettings &c) {
+  c.sameGain = afe44xx_sameGain;
+  c.stage2Gain1 = afe44xx_stage2Gain1; c.stage2Gain2 = afe44xx_stage2Gain2;
+  c.CF1 = afe44xx_CF1; c.CF2 = afe44xx_CF2; c.RF1 = afe44xx_RF1; c.RF2 = afe44xx_RF2;
+  c.Fc = afe44xx_Fc; c.CAmbient = afe44xx_CAmbient;
+  c.txRefVoltage = afe44xx_txRefVoltage; c.range = afe44xx_range;
+  c.led1Power = afe44xx_led1Power; c.led2Power = afe44xx_led2Power;
+  c.tristate = afe44xx_tristate; c.hbridge = afe44xx_hbridge; c.bypassADC = afe44xx_bypassADC;
+  c.powerRX = afe44xx_powerRX; c.powerTX = afe44xx_powerTX; c.powerAFE = afe44xx_powerAFE;
+  c.shortDiag = afe44xx_shortDiag; c.useXTAL = afe44xx_useXTAL;
+  c.alarmpins = afe44xx_alarmpins; c.numAverage = afe44xx_numAverage; c.factor = afe44xx_factor;
+}
+
+// Copy a struct into the settings globals (does not touch the AFE)
+void restoreSettings(const AfeSettings &c) {
+  afe44xx_sameGain = c.sameGain;
+  afe44xx_stage2Gain1 = c.stage2Gain1; afe44xx_stage2Gain2 = c.stage2Gain2;
+  afe44xx_CF1 = c.CF1; afe44xx_CF2 = c.CF2; afe44xx_RF1 = c.RF1; afe44xx_RF2 = c.RF2;
+  afe44xx_Fc = c.Fc; afe44xx_CAmbient = c.CAmbient;
+  afe44xx_txRefVoltage = c.txRefVoltage; afe44xx_range = c.range;
+  afe44xx_led1Power = c.led1Power; afe44xx_led2Power = c.led2Power;
+  afe44xx_tristate = c.tristate; afe44xx_hbridge = c.hbridge; afe44xx_bypassADC = c.bypassADC;
+  afe44xx_powerRX = c.powerRX; afe44xx_powerTX = c.powerTX; afe44xx_powerAFE = c.powerAFE;
+  afe44xx_shortDiag = c.shortDiag; afe44xx_useXTAL = c.useXTAL;
+  afe44xx_alarmpins = c.alarmpins; afe44xx_numAverage = c.numAverage; afe44xx_factor = c.factor;
+}
+
+void printPreferencesProfile() {
+  Preferences prefs;
+  if (!prefs.begin(AFE_PREF_NAMESPACE, true)) { LOGln("Preferences open failed"); return; }
+  const uint16_t schema = prefs.getUShort("schema", 0U);
+  prefs.end();
+  LOGln("==Saved NVS Settings============================================================");
+  snprintf(tmpStr, sizeof(tmpStr), "Namespace: %s  Schema: %u (expected %u)", AFE_PREF_NAMESPACE, schema, AFE_PREF_SCHEMA_VERSION); LOGln("%s", tmpStr);
+  if (schema != AFE_PREF_SCHEMA_VERSION) {
+    LOGln("No compatible saved settings found");
+  } else {
+    LOGln("Saved settings exist, use Pl to load them, s to show active settings");
+  }
+  LOGln("================================================================================");
+}
+
+bool savePreferencesProfile() {
+  Preferences prefs;
+  if (!prefs.begin(AFE_PREF_NAMESPACE, false)) { LOGln("Preferences save failed: namespace open failed"); return false; }
+  AfeSettings c; captureSettings(c);
+  prefs.putUShort("schema", AFE_PREF_SCHEMA_VERSION);
+  prefs.putBool("sameGain", c.sameGain);
+  prefs.putChar("s2g1", c.stage2Gain1); prefs.putChar("s2g2", c.stage2Gain2);
+  prefs.putShort("cf1", c.CF1); prefs.putShort("cf2", c.CF2);
+  prefs.putShort("rf1", c.RF1); prefs.putShort("rf2", c.RF2);
+  prefs.putUChar("fc", c.Fc); prefs.putUChar("camb", c.CAmbient);
+  prefs.putUChar("txref", c.txRefVoltage); prefs.putUChar("range", c.range);
+  prefs.putUChar("led1", c.led1Power); prefs.putUChar("led2", c.led2Power);
+  prefs.putBool("tristate", c.tristate); prefs.putBool("hbridge", c.hbridge); prefs.putBool("bypass", c.bypassADC);
+  prefs.putBool("pwrrx", c.powerRX); prefs.putBool("pwrtx", c.powerTX); prefs.putBool("pwrafe", c.powerAFE);
+  prefs.putBool("shortdiag", c.shortDiag); prefs.putBool("xtal", c.useXTAL);
+  prefs.putUChar("alarm", c.alarmpins); prefs.putUChar("navg", c.numAverage);
+  prefs.putFloat("factor", c.factor);
+  prefs.end();
+  LOGln("Settings saved to NVS");
+  return true;
+}
+
+// Load settings from NVS into globals; values are range checked, invalid ones keep the current value.
+bool loadPreferencesProfile(bool report) {
+  Preferences prefs;
+  if (!prefs.begin(AFE_PREF_NAMESPACE, true)) {
+    if (report) { LOGln("Preferences load failed: namespace open failed"); }
+    return false;
+  }
+  if (prefs.getUShort("schema", 0U) != AFE_PREF_SCHEMA_VERSION) {
+    prefs.end();
+    if (report) { LOGln("No compatible saved settings found"); }
+    return false;
+  }
+  AfeSettings c; captureSettings(c);  // defaults = current values
+  c.sameGain    = prefs.getBool("sameGain", c.sameGain);
+  c.stage2Gain1 = prefs.getChar("s2g1", c.stage2Gain1); if (c.stage2Gain1 < -1 || c.stage2Gain1 > 4) c.stage2Gain1 = afe44xx_stage2Gain1;
+  c.stage2Gain2 = prefs.getChar("s2g2", c.stage2Gain2); if (c.stage2Gain2 < -1 || c.stage2Gain2 > 4) c.stage2Gain2 = afe44xx_stage2Gain2;
+  c.CF1 = prefs.getShort("cf1", c.CF1); if (c.CF1 < 0 || c.CF1 > 275)   c.CF1 = afe44xx_CF1;
+  c.CF2 = prefs.getShort("cf2", c.CF2); if (c.CF2 < 0 || c.CF2 > 275)   c.CF2 = afe44xx_CF2;
+  c.RF1 = prefs.getShort("rf1", c.RF1); if (c.RF1 < -1 || c.RF1 > 1000) c.RF1 = afe44xx_RF1;
+  c.RF2 = prefs.getShort("rf2", c.RF2); if (c.RF2 < -1 || c.RF2 > 1000) c.RF2 = afe44xx_RF2;
+  c.Fc       = prefs.getUChar("fc", c.Fc);        if (c.Fc > 1)        c.Fc = afe44xx_Fc;
+  c.CAmbient = prefs.getUChar("camb", c.CAmbient); if (c.CAmbient > 10) c.CAmbient = afe44xx_CAmbient;
+  c.txRefVoltage = prefs.getUChar("txref", c.txRefVoltage); if (c.txRefVoltage > 3) c.txRefVoltage = afe44xx_txRefVoltage;
+  c.range        = prefs.getUChar("range", c.range);        if (c.range > 3)        c.range = afe44xx_range;
+  c.led1Power = prefs.getUChar("led1", c.led1Power);
+  c.led2Power = prefs.getUChar("led2", c.led2Power);
+  c.tristate  = prefs.getBool("tristate", c.tristate);
+  c.hbridge   = prefs.getBool("hbridge", c.hbridge);
+  c.bypassADC = prefs.getBool("bypass", c.bypassADC);
+  c.powerRX   = prefs.getBool("pwrrx", c.powerRX);
+  c.powerTX   = prefs.getBool("pwrtx", c.powerTX);
+  c.powerAFE  = prefs.getBool("pwrafe", c.powerAFE);
+  c.shortDiag = prefs.getBool("shortdiag", c.shortDiag);
+  c.useXTAL   = prefs.getBool("xtal", c.useXTAL);
+  c.alarmpins = prefs.getUChar("alarm", c.alarmpins); if (c.alarmpins > 7) c.alarmpins = afe44xx_alarmpins;
+  c.numAverage = prefs.getUChar("navg", c.numAverage); if (c.numAverage < 1 || c.numAverage > 16) c.numAverage = afe44xx_numAverage;
+  c.factor = prefs.getFloat("factor", c.factor); if (!(c.factor >= 0.1f && c.factor <= 100.0f)) c.factor = afe44xx_factor;
+  prefs.end();
+  restoreSettings(c);
+  if (report) { LOGln("Settings loaded from NVS"); }
+  return true;
+}
+
+bool clearPreferencesProfile() {
+  Preferences prefs;
+  if (!prefs.begin(AFE_PREF_NAMESPACE, false)) { LOGln("Preferences clear failed: namespace open failed"); return false; }
+  const bool ok = prefs.clear();
+  prefs.end();
+  LOGln("%s", ok ? "Saved NVS settings cleared" : "Preferences clear failed");
+  return ok;
+}
+
+// Write all settings to the AFE registers, restarts acquisition if it was running
+void applySettings() {
+  bool wasRunning = afe44xx_running;
+  if ((bool)afe44xx_running == true) { afe44xx_running=afe44xx.stop(); }
+  afe44xx.setTimers(afe44xx_factor);                        // default timing
+  afe44xx.clearCNTRL0();                                    // clear CONTROL0 register
+  afe44xx.bypassADC(afe44xx_bypassADC);                     // use internal/external ADC
+  afe44xx.setOscillator(afe44xx_useXTAL);                   // use external crystal or clock signal
+  afe44xx.setShortDiagnostic(afe44xx_shortDiag);            // short or long diagnostic sequence
+  afe44xx.setTristate(afe44xx_tristate);                    // tri state or push pull output
+  afe44xx.setHbridge(afe44xx_hbridge);                      // h bridge or push pull output
+  afe44xx.setAlarmpins(afe44xx_alarmpins);                  // monitor activity on PD and LED alarm pins  
+  afe44xx.setPowerAFE(afe44xx_powerAFE);                    // power up/down
+  afe44xx.setPowerRX(afe44xx_powerRX);                      // power up/down
+  afe44xx.setPowerTX(afe44xx_powerTX);                      // power up/down
+  afe44xx.setSameGain(afe44xx_sameGain);                    // same or separate settings for LED1 and LED2
+  afe44xx.setFirstStageFeedbackCapacitor(afe44xx_CF1,1);    // e.g. 5pF, LED1
+  afe44xx.setFirstStageFeedbackCapacitor(afe44xx_CF2,2);    // e.g. 5pF,LED2
+  afe44xx.setFirstStageFeedbackResistor(afe44xx_RF1,1);     // e.g. 500kOhm LED1
+  afe44xx.setFirstStageFeedbackResistor(afe44xx_RF2,2);     // e.g. 500kOhm LED1
+  afe44xx.setFirstStageCutOffFrequency(afe44xx_Fc );        // 500 or 100 Hz low pass
+  afe44xx.setSecondStageGain(afe44xx_stage2Gain1, true, 1); // gain enabled, on LED1
+  afe44xx.setSecondStageGain(afe44xx_stage2Gain2, true, 2); // gain enabled on LED2
+  afe44xx.setCancellationCurrent(afe44xx_CAmbient);         // e.g. 0 microAmp
+  afe44xx.setLEDdriver(afe44xx_txRefVoltage,afe44xx_range); // e.g. 0.75V, 150mA
+  afe44xx.setLEDpower(afe44xx_led1Power, 1);                // e.g. 24 of 255 on both LEDs
+  afe44xx.setLEDpower(afe44xx_led2Power, 2);                // e.g. 24 of 255 on both LEDs
+  if (wasRunning == true) { afe44xx_running=afe44xx.start(afe44xx_numAverage); } // number of averages and start of system
+}
+
+// USER INTERFACE
+//////////////////////////////////////////////////////////////////////////////////////////////
+
+// Help Menu
+void helpMenu() {
+  LOGln("================================================================================");
+  LOGln("| AFE4490 Pulse Oximeter Analog Front End Program                              |");
+  LOGln("| 2026 Urs Utzinger                                                            |");
+  LOGln("================================================================================");
+  LOGln("| GENERAL COMMANDS                       | DATA COMMANDS                       |");
+  LOGln("|----------------------------------------|-------------------------------------|");
+  LOGln("| ?: help screen                         | z: toggle data reporting on/off     |");
+  LOGln("| s: show current settings               | z[s|b|a]: USB, BLE, both, off       |");
+  LOGln("| a: apply current settings (re-setup)   |                                     |");
+  LOGln("| h: run health check                    | z[S|B|A]: USB, BLE, both, on        |");
+  LOGln("| i: print device info                   | zz: print one sample                |");
+  LOGln("| r: print all registers                 | c: reset sample counter             |");
+  LOGln("| t: print status (diagnostics)          |                                     |");
+  LOGln("| p: print timing registers              |                                     |");
+  LOGln("| x: reboot                              |                                     |");
+  LOGln("================================================================================");
+  LOGln("| PERSISTENCE                            | RAM SNAPSHOT                        |");
+  LOGln("|----------------------------------------|-------------------------------------|");
+  LOGln("| Ps: save NVS preferences               | (: save settings snapshot           |");
+  LOGln("| Pl: load NVS preferences               | ): restore settings snapshot        |");
+  LOGln("| Pd: print NVS preferences              |                                     |");
+  LOGln("| Pc: clear NVS preferences              |                                     |");
+  LOGln("|========================================|=====================================|");
+  LOGln("| ACQUISITION SETTINGS                   | START/STOP                          |");
+  LOGln("|----------------------------------------|-------------------------------------|");
+  LOGln("| Ma<n>: averages  (1-16)     Ma4        | .: toggle start/stop                |");
+  LOGln("| Mt<f>: timing factor (0.1-100) Mt1     | >: start measurement                |");
+  LOGln("| Mp<n>: alarm pins (0-7)       Mp5      | <: stop measurement                 |");
+  LOGln("|========================================|=====================================|");
+  LOGln("| RECEIVER SETTINGS                      | TRANSMITTER SETTINGS                |");
+  LOGln("|----------------------------------------|-------------------------------------|");
+  LOGln("| Rg1: stage2 gain LED1 (-1..4) Rg1-1    | TV<n>: ref voltage (0-3)     TV0    |");
+  LOGln("| Rg2: stage2 gain LED2 (-1..4) Rg23     | TC<n>: current range (0-3)   TC0    |");
+  LOGln("| RC1: feedback cap LED1 (pF)   RC15     | LP1<n>: LED1 power (0-255) LP1255   |");
+  LOGln("| RC2: feedback cap LED2 (pF)   RC25     | LP2<n>: LED2 power (0-255) LP2255   |");
+  LOGln("| RR1: feedback res LED1 (kOhm) RR1200   |                                     |");
+  LOGln("| RR2: feedback res LED2 (kOhm) RR2200   |                                     |");
+  LOGln("| RFC<n>: filter edge (0=500,1=1000 Hz)  |                                     |");
+  LOGln("| RFB<n>: ambient current (0-9 uA) RFB1  |                                     |");
+  LOGln("|========================================|=====================================|");
+  LOGln("| HARDWARE OPTIONS                       | POWER                               |");
+  LOGln("|----------------------------------------|-------------------------------------|");
+  LOGln("| Xt1: same gain LED1&2 on/off           | Xt5: RX power on/off                |");
+  LOGln("| Xt2: tri state on/off                  | Xt6: TX power on/off                |");
+  LOGln("| Xt3: h bridge on/off                   | Xt7: AFE power on/off               |");
+  LOGln("| Xt4: bypass ADC on/off                 |                                     |");
+  LOGln("|========================================|=====================================|");
+  LOGln("| LOG LEVEL                              | SPECIAL                             |");
+  LOGln("|----------------------------------------|-------------------------------------|");
+  LOGln("| l0: debug (verbose)                    | w: AFE software reset               |");
+  LOGln("| l1: info (default)                     |                                     |");
+  LOGln("| l2: warnings                           |                                     |");
+  LOGln("| l3: errors only                        |                                     |");
+  LOGln("| l4: critical only                      |                                     |");
+  LOGln("| l5: none (silent)                      |                                     |");
+  LOGln("================================================================================");
+  LOGln("");
+  LOGln("Examples:");
+  LOGln("  Rg13     - Set stage 2 gain of LED1 to 3 (Rg2<n> for LED2)");
+  LOGln("  LP1128   - Set LED1 power to 128");
+  LOGln("  Mt0.5    - Set timing factor to 0.5 (1000 samples per second)");
+  LOGln("  .        - Start/stop measurement");
+  LOGln("  z        - Toggle continuous data display");
+  LOGln("");
+}
+
+// Gain label for second stage gain index
+const char* stage2GainLabel(int8_t gain) {
+  switch (gain) {
+    case -1: return "disabled";
+    case 0:  return "1";
+    case 1:  return "1.5";
+    case 2:  return "2";
+    case 3:  return "3";
+    case 4:  return "4";
+    default: return "?";
+  }
+}
+
+// Show Current Settings
+void showSettings() {
+  LOGln("================================================================================");
+  LOGln("Current Settings:");
+  LOGln("================================================================================");
+  LOGln("--General--");
+  LOGln("Running: %s | Data Display: %s", afe44xx_running ? "YES" : "NO", data_reporting ? "ON" : "OFF");
+  LOGln("Data Output: USB %s | BLE %s", (data_output_mask & DATA_OUT_SERIAL) ? "ON" : "OFF", (data_output_mask & DATA_OUT_BLE) ? "ON" : "OFF");
+  LOGln("Log Level: %d", logGetLevel());
+  LOGln("Timing factor: %.2f", afe44xx_factor);
+  LOGln("Number of averages: %u", afe44xx_numAverage);
+  LOGln("Sampling rate: %.1f S/s | Samples: %lu", samplingRate, static_cast<unsigned long>(sample_count));
+  LOGln("--Receiver--");
+  LOGln("Same Gain: %s", afe44xx_sameGain ? "On" : "Off");
+  LOGln("Stage 2 Gain LED1: %s", stage2GainLabel(afe44xx_stage2Gain1));
+  LOGln("Stage 2 Gain LED2: %s", stage2GainLabel(afe44xx_stage2Gain2));
+  LOGln("LED1 Cf: %d pF | Rf: %d kOhm", afe44xx_CF1, afe44xx_RF1);
+  LOGln("LED2 Cf: %d pF | Rf: %d kOhm", afe44xx_CF2, afe44xx_RF2);
+  LOGln("Lowpass edge frequency: %s Hz", (afe44xx_Fc == 0) ? "500" : "1000");
+  LOGln("Ambient background current: %d uA", afe44xx_CAmbient);
+  LOGln("--Transmitter--");
+  switch (afe44xx_txRefVoltage) {
+    case 0:  LOGln("TX ref Voltage: %.2f V", 0.75); break;
+    case 1:  LOGln("TX ref Voltage: %.2f V", 0.5);  break;
+    case 2:  LOGln("TX ref Voltage: %.2f V", 0.75); break;
+    case 3:  LOGln("TX ref Voltage: %.2f V", 1.0);  break;
+    default: LOGln("TX ref Voltage: unknown");      break;
+  }
+  if (afe44xx_range == 3) {
+    LOGln("Current range: Off");
+  } else {
+    // low range (1) is half of the high range (0, 2)
+    static const int highRange[4] = {150, 100, 150, 200};  // mA for ref voltage 0, 1, 2, 3
+    const int high = highRange[afe44xx_txRefVoltage & 3];
+    LOGln("Current range: %d mA", (afe44xx_range == 1) ? high / 2 : high);
+  }
+  LOGln("LED1 power: %u", afe44xx_led1Power);
+  LOGln("LED2 power: %u", afe44xx_led2Power);
+  LOGln("--I/O--");
+  LOGln("Tri State: %s | H Bridge: %s | Bypass ADC: %s", afe44xx_tristate ? "On" : "Off", afe44xx_hbridge ? "On" : "Off", afe44xx_bypassADC ? "On" : "Off");
+  LOGln("Power RX: %s TX: %s AFE: %s", afe44xx_powerRX ? "On" : "Off", afe44xx_powerTX ? "On" : "Off", afe44xx_powerAFE ? "On" : "Off");
+  LOGln("Alarm Pins: %u", afe44xx_alarmpins);
+  LOGln("--Diagnostics--");
+  afe44xx.readDiag(afe44xx_diag_status);
+  afe44xx.printDiag(afe44xx_diag_status);
+  LOGln("================================================================================");
+}
+
+/******************************************************************************************************/
+// Command Handlers
+/******************************************************************************************************/
+
+void processCommand(const char* input_buff, CommandSource source) {
+  if (input_buff == nullptr) return;
+
+  while (*input_buff == ' ' || *input_buff == '\t') {
+    input_buff++;
+  }
+
+  char command_buff[128];
+  size_t len = strnlen(input_buff, sizeof(command_buff) - 1U);
+  memcpy(command_buff, input_buff, len);
+  command_buff[len] = '\0';
+  while (len > 0U && (command_buff[len - 1U] == ' ' || command_buff[len - 1U] == '\t')) {
+    command_buff[--len] = '\0';
+  }
+
+  if (len == 0U) return;  // Empty command
+
+  active_command_source = source;
+
+  // Single-character commands
+  if (len == 1U) {
+    handleGeneralCommand(command_buff[0]);
+  }
+  // Parameter commands
+  else {
+    handleParameterCommand(command_buff);
+  }
+}
+
+void handleGeneralCommand(char cmd) {
+  switch (cmd) {
+    case '?':  // Help
+      helpMenu();
+      break;
+
+    case 's':  // Show settings
+      showSettings();
+      break;
+
+    case 'a':  // Apply settings
+      applySettings();
+      LOGln("Settings applied");
+      break;
+
+    case 'h':  // Health check
+      {
+        const bool wasRunning = afe44xx_running;
+        if (wasRunning) { afe44xx_running = afe44xx.stop(); }
+        afe44xx.readDiag(afe44xx_diag_status);
+        afe44xx.printDiag(afe44xx_diag_status);
+        const bool ok = afe44xx.selfCheck();
+        if (wasRunning) { afe44xx_running = afe44xx.start(afe44xx_numAverage); }
+        LOGln("Self check: %s", ok ? "PASS" : "FAIL");
+      }
+      break;
+
+    case 'i':  // Print device info
+      LOGln("==Device Info==");
+      LOGln("");
+      LOGln("AFE--");
+      LOGln("  Running: %s", afe44xx_running ? "YES" : "NO");
+      LOGln("  PD alarm pin: %s", digitalRead(PDALARM_PIN) ? "HIGH" : "LOW");
+      LOGln("  LED alarm pin: %s", digitalRead(LEDALARM_PIN) ? "HIGH" : "LOW");
+      LOGln("  Diag end pin: %s", digitalRead(DIAGEND_PIN) ? "HIGH" : "LOW");
+
+      LOGln("");
+      LOGln("Routing--");
+      LOG("  Current command source/response destination: ");
+      LOGln("%s", active_command_source == CommandSource::Ble ? "BLE" : "USB Serial");
+      printDataOutputSettings();
+
+      LOGln("");
+      LOGln("USB Serial--");
+      LOG("  Connected: ");
+      LOGln("%s", static_cast<bool>(Serial) ? "YES" : "NO");
+      LOG("  Available for write: ");
+      LOGln("%d", Serial.availableForWrite());
+
+      LOGln("");
+      LOGln("BLE--");
+      LOG("  Connected: ");
+      LOGln("%s", ble.isConnected() ? "YES" : "NO");
+      LOG("  Subscribed: ");
+      LOGln("%s", ble.isSubscribed() ? "YES" : "NO");
+      LOG("  Pump mode: ");
+      LOGln("%s", ble.getPumpMode() == BLESerial::PumpMode::Task ? "Task" : "Polling");
+      LOG("  TX buffer free: ");
+      LOGln("%u", static_cast<unsigned>(ble.getTxFree()));
+      if (active_command_source == CommandSource::Ble) {
+        ble.printStats(ble);
+      } else {
+        ble.printStats(Serial);
+      }
+      break;
+
+    case 'r':  // Print all registers
+      afe44xx.dumpRegisters();
+      break;
+
+    case 't':  // Print status (diagnostics)
+      {
+        const bool wasRunning = afe44xx_running;
+        if (wasRunning) { afe44xx_running = afe44xx.stop(); }
+        afe44xx.readDiag(afe44xx_diag_status);
+        afe44xx.printDiag(afe44xx_diag_status);
+        if (wasRunning) { afe44xx_running = afe44xx.start(afe44xx_numAverage); }
+      }
+      break;
+
+    case 'p':  // Print timing registers
+      LOGln("==Timer Settings================================================================");
+      afe44xx.readTimers();
+      LOGln("================================================================================");
+      break;
+
+    case '(':  // Save settings snapshot
+      captureSettings(afe44xx_snapshot);
+      afe44xx_snapshot_valid = true;
+      LOGln("Settings saved to snapshot");
+      break;
+
+    case ')':  // Restore settings snapshot
+      if (!afe44xx_snapshot_valid) {
+        LOGln("No settings snapshot available");
+      } else {
+        restoreSettings(afe44xx_snapshot);
+        applySettings();
+        LOGln("Settings restored from snapshot");
+      }
+      break;
+
+    case 'w':  // Software reset
+      LOGln("Performing software reset...");
+      afe44xx.reset();
+      afe44xx_running = false;
+      LOGln("Reset complete. Use 'a' to apply settings and '>' to start.");
+      break;
+
+    case 'x':  // Reboot
+      LOGln("Rebooting...");
+      #ifdef ARDUINO_ARCH_ESP32
+        ESP.restart();
+      #else
+        LOGln("Reboot not supported on this platform");
+      #endif
+      break;
+
+    case 'c':  // Reset sample counter
+      sample_count = 0UL;
+      LOGln("Sample counter reset");
+      break;
+
+    case 'z':  // Toggle data display
+      data_reporting = !data_reporting;
+      if (data_reporting && data_output_mask == 0U) {
+        data_output_mask = DATA_OUT_ALL;
+      }
+      printDataOutputSettings();
+      break;
+
+    case '.':  // Toggle start/stop
+      if (afe44xx_running) {
+        afe44xx_running = afe44xx.stop();
+        LOGln("Stopped data acquisition");
+      } else {
+        afe44xx_running = afe44xx.start(afe44xx_numAverage);
+        LOGln("Started data acquisition with average of %u", afe44xx_numAverage);
+      }
+      break;
+
+    case '>':  // Start
+      afe44xx_running = afe44xx.start(afe44xx_numAverage);
+      LOGln("Started data acquisition with average of %u", afe44xx_numAverage);
+      break;
+
+    case '<':  // Stop
+      if (afe44xx_running) {
+        afe44xx_running = afe44xx.stop();
+        LOGln("Stopped data acquisition");
+      } else {
+        LOGln("Not running");
+      }
+      break;
+
+    default:
+      LOGln("Unknown command");
+      break;
+  }
+}
+
+// Receiver (R), transmitter (T) and LED power (L) commands.
+// Commands set tmpStr to a response message which is printed at the end.
+void handleReceiverTransmitterCommand(const char* command) {
   long tmpI;                            // int
   int commandLen = strlen(command);     // length of command
 
   if (commandLen < 2) {
-    snprintf(tmpStr, sizeof(tmpStr), "Command too short: %s chars. Check help with ?", command); Serial.println(tmpStr);
+    snprintf(tmpStr, sizeof(tmpStr), "Command too short: %s chars. Check help with ?", command); LOGln("%s", tmpStr);
     return;
   }
-  
+
   switch (command[0]) {
 
     // Check if first character is 'R' for Receiver Stage
@@ -384,7 +1047,7 @@ void handleUppercaseCommand(const char* command) {
       } else if (commandLen == 3) {
         tmpI = 0;
       } else {
-        snprintf(tmpStr, sizeof(tmpStr), "Command too short: %s chars. Check help with ?", command); Serial.println(tmpStr);
+        snprintf(tmpStr, sizeof(tmpStr), "Command too short: %s chars. Check help with ?", command); LOGln("%s", tmpStr);
         return;
       }
       switch (command[1]){
@@ -503,7 +1166,7 @@ void handleUppercaseCommand(const char* command) {
       } else if (commandLen == 2) {
         tmpI = 0;
       } else {
-        snprintf(tmpStr, sizeof(tmpStr), "Command too short: %s chars. Check help with ?", command); Serial.println(tmpStr);
+        snprintf(tmpStr, sizeof(tmpStr), "Command too short: %s chars. Check help with ?", command); LOGln("%s", tmpStr);
         return;
       }
       switch (command[1]){
@@ -548,7 +1211,7 @@ void handleUppercaseCommand(const char* command) {
       } else if (commandLen == 3) {
         tmpI = 0;
       } else {
-        snprintf(tmpStr, sizeof(tmpStr), "Command too short: %s. Check help with ?", command); Serial.println(tmpStr);
+        snprintf(tmpStr, sizeof(tmpStr), "Command too short: %s. Check help with ?", command); LOGln("%s", tmpStr);
         return;
       }
       if (command[1] == 'P') {
@@ -581,339 +1244,229 @@ void handleUppercaseCommand(const char* command) {
     }
 
     default: {
-      snprintf(tmpStr, sizeof(tmpStr), "Unknown command: %s", command); Serial.println(tmpStr);
+      snprintf(tmpStr, sizeof(tmpStr), "Unknown command: %s", command);
       break;
     }
 
   }
-  Serial.println(tmpStr);
-
+  LOGln("%s", tmpStr);
 }
 
-// Process Lower Case Commands
-void handleLowercaseCommand(const char* command) {
-  unsigned long tmpuI;                  // unsigned int
-  float tmpF;                           // float
-  bool wasRunning;
-  int commandLen = strlen(command);
+void handleParameterCommand(const char* command) {
+  const size_t command_len = strlen(command);
+  const char cmd1 = command[0];
+  const char cmd2 = (command_len > 1U) ? command[1] : '\0';
+  const char* numeric_text = (cmd1 == 'l') ? &command[1] : &command[2];
+  char* numeric_end = nullptr;
+  const long value = strtol(numeric_text, &numeric_end, 10);
+  const bool numeric_valid =
+    numeric_text[0] != '\0' && numeric_end != numeric_text && *numeric_end == '\0';
 
-  if (commandLen < 1) {
-      Serial.println("Command too short");
+  // Data reporting output commands
+  if (cmd1 == 'z') {
+    if (command_len != 2U) {
+      LOGln("Data reporting commands must be exactly two characters");
       return;
+    }
+    switch (cmd2) {
+      case 's':
+        data_output_mask &= static_cast<uint8_t>(~DATA_OUT_SERIAL);
+        break;
+
+      case 'b':
+        data_output_mask &= static_cast<uint8_t>(~DATA_OUT_BLE);
+        break;
+
+      case 'a':
+        data_output_mask = 0U;
+        break;
+
+      case 'S':
+        data_output_mask |= DATA_OUT_SERIAL;
+        data_reporting = true;
+        break;
+
+      case 'B':
+        data_output_mask |= DATA_OUT_BLE;
+        data_reporting = true;
+        break;
+
+      case 'A':
+        data_output_mask = DATA_OUT_ALL;
+        data_reporting = true;
+        break;
+
+      case 'z':  // print one sample
+        afe44xx.getData(irRawValue, redRawValue, irAmbientValue, redAmbientValue, irValue, redValue);
+        LOGln("IR: %ld\tRed: %ld\tIR_r: %ld\tRed_r: %ld\tIR_a: %ld\tRed_a: %ld",
+              (long)irValue, (long)redValue, (long)irRawValue, (long)redRawValue, (long)irAmbientValue, (long)redAmbientValue);
+        return;
+
+      default:
+        LOGln("Unknown data reporting command");
+        return;
+    }
+    if (data_output_mask == 0U) {
+      data_reporting = false;
+    }
+    printDataOutputSettings();
+    return;
   }
 
-  switch (command[0]) {
+  // Log level commands
+  if (cmd1 == 'l') {
+    if (!numeric_valid || value < LOG_LEVEL_DEBUG || value > LOG_LEVEL_NONE) {
+      LOGln("Log level must be 0-5 (debug, info, warn, error, critical, none)");
+      return;
+    }
+    logSetLevel(static_cast<int>(value));
+    LOG("Log level set to: ");
+    LOGln("%ld", value);
+    return;
+  }
 
-    case 'l': { // set debug level
-      if (commandLen > 1) {
-        tmpuI = strtoul(&command[1], NULL, 10);
-        if (tmpuI >= 0 && tmpuI <= 4) {
-          currentLogLevel = (unsigned int)tmpuI;
-          afe44xx_reporting = false;
-          snprintf(tmpStr, sizeof(tmpStr), "Debug level set to: %u", currentLogLevel);
-        } else if (tmpuI==99) {
-          currentLogLevel = 0;
-          afe44xx_reporting = true;
-          strcpy(tmpStr, "Reporting enabled");
-        } else {
-          strcpy(tmpStr, "Debug level out of valid range [0..4,99]");
+  // Non-volatile preferences commands. These store the sketch settings,
+  // not raw AFE register snapshots.
+  if (cmd1 == 'P') {
+    if (command_len != 2U) {
+      LOGln("Preferences commands must be exactly two characters");
+      return;
+    }
+    switch (cmd2) {
+      case 's':  // Save preferences
+        savePreferencesProfile();
+        break;
+
+      case 'l':  // Load preferences
+        if (loadPreferencesProfile(true)) { applySettings(); }
+        break;
+
+      case 'c':  // Clear preferences
+        clearPreferencesProfile();
+        break;
+
+      case 'd':  // Display active preference profile
+        printPreferencesProfile();
+        break;
+
+      default:
+        LOGln("Unknown preferences command");
+        break;
+    }
+    return;
+  }
+
+  // Acquisition settings
+  if (cmd1 == 'M') {
+    switch (cmd2) {
+      case 'a': {  // number of averages
+        if (!numeric_valid || value < 1 || value > 16) {
+          LOGln("Number of averages out of range [1..16]");
+          return;
         }
-      } else {
-        strcpy(tmpStr, "No log level provided. Check help with ?");
-      }
-      Serial.println(tmpStr);
-      break;
-    }
-
-    case 't': { // set timing
-      if (commandLen > 1) {
-        tmpF = atof(&command[1]);
-        if (tmpF >= 0.1 && tmpF <= 100.0) {
-          afe44xx_factor = tmpF;
-          if ((bool)afe44xx_running == true) {
-            afe44xx_running = afe44xx.stop();
-            afe44xx.setTimers(afe44xx_factor);
-            afe44xx_running = afe44xx.start(afe44xx_numAverage); 
-            snprintf(tmpStr, sizeof(tmpStr), "Re-started data acquisition with timing factor of %.2f and averaging of %4u", afe44xx_factor, afe44xx_numAverage);
-          } else {
-            afe44xx.setTimers(afe44xx_factor);
-            snprintf(tmpStr, sizeof(tmpStr), "System not running, Timing factor set to: %.2f", afe44xx_factor);
-          }
+        afe44xx_numAverage = static_cast<uint8_t>(value);
+        if (afe44xx_running) {
+          afe44xx_running = afe44xx.stop();
+          delay(10);
+          afe44xx_running = afe44xx.start(afe44xx_numAverage);
+          LOGln("Re-started data acquisition with average of %u", afe44xx_numAverage);
         } else {
-          strcpy(tmpStr, "Timing factor out of valid range [0,1..100.0]");
+          LOGln("System not running, number of averages set to: %u", afe44xx_numAverage);
         }
-      } else {
-        strcpy(tmpStr, "No timing factor provided. Check help with ?");
+        return;
       }
-      Serial.println(tmpStr);
-      break;
-    }
-
-    case '?': // help
-      helpMenu();
-      break;
-
-    case 'z': { // print sensor data
-      afe44xx.getData(irRawValue, redRawValue, irAmbientValue, redAmbientValue, irValue, redValue);
-      Serial.print("IR: ");
-      Serial.print(irValue);
-      Serial.print("\tRed: ");
-      Serial.print(redRawValue);
-      Serial.print("\tIR_r: ");
-      Serial.print(irRawValue);
-      Serial.print("\tRed_r: ");
-      Serial.print(redValue);
-      Serial.print("\tIR_a: ");
-      Serial.print(irAmbientValue);
-      Serial.print("\tRed_a: ");
-      Serial.println(redAmbientValue);
-      break;
-    }
-
-    case 'd': { // run diagnostics
-      bool wasRunning = afe44xx_running;
-      if ((bool)afe44xx_running == true) { afe44xx_running=afe44xx.stop(); }
-      afe44xx.readDiag(afe44xx_diag_status);
-      afe44xx.printDiag(afe44xx_diag_status);
-      if (wasRunning == true) { afe44xx_running=afe44xx.start(afe44xx_numAverage); }
-      break;
-    }
-
-    case 'x': { // toggle options
-      if (commandLen > 1) {
-        tmpuI = strtoul(&command[1], NULL, 10);
-        if (tmpuI >= 0 && tmpuI <= 10) {
-          switch (tmpuI){
-            case 1: {
-              afe44xx_sameGain = !afe44xx_sameGain;
-              if (afe44xx.setSameGain(afe44xx_sameGain) == 0) {
-                snprintf(tmpStr, sizeof(tmpStr), "Same gain: %s", (afe44xx_sameGain) ? "On" : "Off");
-              } else {
-                snprintf(tmpStr, sizeof(tmpStr), "Error: Same gain could not be set to: %s", (afe44xx_sameGain) ? "On" : "Off");
-              }
-              break;
-            }
-            case 2: {
-              afe44xx_tristate = !afe44xx_tristate;
-              afe44xx.setTristate(afe44xx_tristate);
-              snprintf(tmpStr, sizeof(tmpStr), "Tri State: %s", (afe44xx_tristate) ? "On" : "Off");
-              break;
-            }
-            case 3: {
-              afe44xx_hbridge = !afe44xx_hbridge;
-              afe44xx.setHbridge(afe44xx_hbridge);
-              snprintf(tmpStr, sizeof(tmpStr), "H bridge: %s", (afe44xx_hbridge) ? "On" : "Off");
-              break;
-            }
-            case 4: {
-              afe44xx_bypassADC = !afe44xx_bypassADC;
-              afe44xx.bypassADC(afe44xx_bypassADC);
-              snprintf(tmpStr, sizeof(tmpStr), "Bypass ADC: %s", (afe44xx_bypassADC) ? "On" : "Off");
-              break;
-            }
-            case 5:{
-              afe44xx_powerRX = !afe44xx_powerRX;
-              afe44xx.setPowerRX(afe44xx_powerRX);
-              snprintf(tmpStr, sizeof(tmpStr), "Power RX: %s", (afe44xx_powerRX) ? "On" : "Off");
-              break;
-            }
-            case 6: {
-              afe44xx_powerTX = !afe44xx_powerTX;
-              afe44xx.setPowerTX(afe44xx_powerTX);
-              snprintf(tmpStr, sizeof(tmpStr), "Power TX: %s", (afe44xx_powerTX) ? "On" : "Off");
-              break;
-            }
-            case 7: {
-              afe44xx_powerAFE = !afe44xx_powerAFE;
-              afe44xx.setPowerAFE(afe44xx_powerAFE);
-              snprintf(tmpStr, sizeof(tmpStr), "Power AFE: %s", (afe44xx_powerAFE) ? "On" : "Off");
-              break;
-            }
-            default: {
-              snprintf(tmpStr, sizeof(tmpStr), "Device not available %u", tmpuI);
-              break;
-            }
-          }
+      case 't': {  // timing factor
+        const float factor = static_cast<float>(atof(numeric_text));
+        if (numeric_text[0] == '\0' || factor < 0.1f || factor > 100.0f) {
+          LOGln("Timing factor out of valid range [0.1..100.0]");
+          return;
+        }
+        afe44xx_factor = factor;
+        if (afe44xx_running) {
+          afe44xx_running = afe44xx.stop();
+          afe44xx.setTimers(afe44xx_factor);
+          afe44xx_running = afe44xx.start(afe44xx_numAverage);
+          LOGln("Re-started data acquisition with timing factor of %.2f and averaging of %u", afe44xx_factor, afe44xx_numAverage);
         } else {
-          strcpy(tmpStr, "Toggeling option not known, need [1..7]");
+          afe44xx.setTimers(afe44xx_factor);
+          LOGln("System not running, timing factor set to: %.2f", afe44xx_factor);
         }
-      } else {
-        strcpy(tmpStr, "No option provided. Check help with ?");
+        return;
       }
-      Serial.println(tmpStr);
-      break;
-    }
-
-    case 'r': { // dump registers
-      afe44xx.dumpRegisters();
-      break;
-    }
-
-    case 'a': { // apply settings
-      bool wasRunning = afe44xx_running;
-      if ((bool)afe44xx_running == true) { afe44xx_running=afe44xx.stop(); }
-      afe44xx.setTimers(afe44xx_factor);                        // default timing
-      afe44xx.clearCNTRL0();                                    // clear CONTROL0 register
-      afe44xx.bypassADC(afe44xx_bypassADC);                     // use internal/external ADC
-      afe44xx.setOscillator(afe44xx_useXTAL);                   // use external crystal or clock signal
-      afe44xx.setShortDiagnostic(afe44xx_shortDiag);            // short or long diagnostic sequence
-      afe44xx.setTristate(afe44xx_tristate);                    // tri state or push pull output
-      afe44xx.setHbridge(afe44xx_hbridge);                      // h bridge or push pull output
-      afe44xx.setAlarmpins(afe44xx_alarmpins);                  // monitor activity on PD and LED alarm pins  
-      afe44xx.setPowerAFE(afe44xx_powerAFE);                    // power up/down
-      afe44xx.setPowerRX(afe44xx_powerRX);                      // power up/down
-      afe44xx.setPowerTX(afe44xx_powerTX);                      // power up/down
-      afe44xx.setSameGain(afe44xx_sameGain);                    // same or separate settings for LED1 and LED2
-      afe44xx.setFirstStageFeedbackCapacitor(afe44xx_CF1,1);    // e.g. 5pF, LED1
-      afe44xx.setFirstStageFeedbackCapacitor(afe44xx_CF2,2);    // e.g. 5pF,LED2
-      afe44xx.setFirstStageFeedbackResistor(afe44xx_RF1,1);     // e.g. 500kOhm LED1
-      afe44xx.setFirstStageFeedbackResistor(afe44xx_RF2,2);     // e.g. 500kOhm LED1
-      afe44xx.setFirstStageCutOffFrequency(afe44xx_Fc );        // 500 or 100 Hz low pass
-      afe44xx.setSecondStageGain(afe44xx_stage2Gain1, true, 1); // gain enabled, on LED1
-      afe44xx.setSecondStageGain(afe44xx_stage2Gain2, true, 2); // gain enabled on LED2
-      afe44xx.setCancellationCurrent(afe44xx_CAmbient);         // e.g. 0 microAmp
-      afe44xx.setLEDdriver(afe44xx_txRefVoltage,afe44xx_range); // e.g. 0.75V, 150mA
-      afe44xx.setLEDpower(afe44xx_led1Power, 1);                // e.g. 24 of 255 on both LEDs
-      afe44xx.setLEDpower(afe44xx_led2Power, 2);                // e.g. 24 of 255 on both LEDs
-      if (wasRunning == true) { afe44xx_running=afe44xx.start(afe44xx_numAverage); } // number of averages and start of system
-      Serial.println("Settings applied");
-      break;
-    }
-
-    case 'e': { // show timers
-      Serial.println("==Timer Settings================================================================");
-      afe44xx.readTimers();
-      Serial.println("================================================================================");
-      break;
-    }
-
-    case 's': { // show settings
-      Serial.println("==Settings======================================================================");
-      Serial.println("===============General:");
-      snprintf(tmpStr, sizeof(tmpStr), "Log Level: %u", currentLogLevel); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "Current Time: %u", currentTime); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "Timing factor: %f", afe44xx_factor); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "Number of averages: %u", afe44xx_numAverage); Serial.println(tmpStr);       
-      Serial.println("===============Detection:");
-      snprintf(tmpStr, sizeof(tmpStr), "Same Gain: %s", (afe44xx_sameGain) ? "On" : "Off"); Serial.println(tmpStr); 
-      if (afe44xx_stage2Gain1 == -1)    { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED1: %s", "disabled"); } 
-      else if(afe44xx_stage2Gain1 == 0) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED1: %u", 1); }
-      else if(afe44xx_stage2Gain1 == 1) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED1: %f", 1.5); }
-      else if(afe44xx_stage2Gain1 == 2) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED1: %u", 2); }
-      else if(afe44xx_stage2Gain1 == 3) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED1: %u", 3); }
-      else if(afe44xx_stage2Gain1 == 4) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED1: %u", 4); }
-      Serial.println(tmpStr);
-      if (afe44xx_stage2Gain2 == -1)    { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED2: %s", "disabled"); } 
-      else if(afe44xx_stage2Gain2 == 0) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED2: %u", 1); }
-      else if(afe44xx_stage2Gain2 == 1) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED2: %f", 1.5); }
-      else if(afe44xx_stage2Gain2 == 2) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED2: %u", 2); }
-      else if(afe44xx_stage2Gain2 == 3) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED2: %u", 3); }
-      else if(afe44xx_stage2Gain2 == 4) { snprintf(tmpStr, sizeof(tmpStr), "Stage 2 Gain LED2: %u", 4); }
-      Serial.println(tmpStr);
-      snprintf(tmpStr, sizeof(tmpStr), "LED1 Cf: %d pF", afe44xx_CF1); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "LED1 Rf: %d kOhm", afe44xx_RF1); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "LED2 Cf: %d pF", afe44xx_CF2); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "LED2 Rf: %d kOhm", afe44xx_RF2); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "Lowpass Edge frequency: %s Hz", (afe44xx_Fc==0) ? "500" : "1000"); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "Ambient background current: %d mu A", afe44xx_CAmbient); Serial.println(tmpStr); 
-      Serial.println("===============Illumination:");
-      switch (afe44xx_txRefVoltage) {
-        case 0:  { snprintf(tmpStr, sizeof(tmpStr), "TX ref Voltage: %fV", 0.75); break;}
-        case 1:  { snprintf(tmpStr, sizeof(tmpStr), "TX ref Voltage: %fV", 0.5);  break;}
-        case 2:  { snprintf(tmpStr, sizeof(tmpStr), "TX ref Voltage: %fV", 0.75); break;}
-        case 3:  { snprintf(tmpStr, sizeof(tmpStr), "TX ref Voltage: %fV", 1.0);  break;}
-        default: {snprintf(tmpStr, sizeof(tmpStr), "TX ref Voltage: %fV", -1.0);  break;}
-      }
-      Serial.println(tmpStr); 
-      if ((afe44xx_txRefVoltage == 0) || (afe44xx_txRefVoltage==2)) {
-        if ((afe44xx_range == 0) || (afe44xx_range == 2) ) { snprintf(tmpStr, sizeof(tmpStr), "Current range: %d mA", 150); }
-        else if (afe44xx_range == 1)                { snprintf(tmpStr, sizeof(tmpStr), "Current range: %d mA", 75); }
-        else if (afe44xx_range == 3)                { snprintf(tmpStr, sizeof(tmpStr), "Current range: %s", "Off"); }
-      } else if (afe44xx_txRefVoltage == 1) {
-        if ((afe44xx_range == 0) || (afe44xx_range == 2) ) { snprintf(tmpStr, sizeof(tmpStr), "Current range: %d mA", 100); }
-        else if (afe44xx_range == 1)                { snprintf(tmpStr, sizeof(tmpStr), "Current range: %d mA", 50); }
-        else if (afe44xx_range == 3)                { snprintf(tmpStr, sizeof(tmpStr), "Current range: %s", "Off"); }
-      } else if (afe44xx_txRefVoltage == 3) {
-        if ((afe44xx_range == 0) || (afe44xx_range == 2) ) { snprintf(tmpStr, sizeof(tmpStr), "Current range: %d mA", 200); }
-        else if (afe44xx_range == 1)                { snprintf(tmpStr, sizeof(tmpStr), "Current range: %d mA", 100); }
-        else if (afe44xx_range == 3)                { snprintf(tmpStr, sizeof(tmpStr), "Current range: %s", "Off"); }
-      }
-      Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "LED1 power: %u", afe44xx_led1Power); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "LED1 power: %u", afe44xx_led2Power); Serial.println(tmpStr); 
-      Serial.println("===============I/O:");
-      snprintf(tmpStr, sizeof(tmpStr), "Tri State: %s", (afe44xx_tristate) ? "On" : "Off"); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "H Bridge: %s", (afe44xx_hbridge) ? "On" : "Off"); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "Bypass ADC: %s", (afe44xx_bypassADC) ? "On" : "Off"); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "Power RX: %s TX: %s AFE: %s", (afe44xx_powerRX) ? "On" : "Off", (afe44xx_powerTX) ? "On" : "Off", (afe44xx_powerAFE) ? "On" : "Off"); Serial.println(tmpStr); 
-      snprintf(tmpStr, sizeof(tmpStr), "Alarm Pins: %u", afe44xx_alarmpins); Serial.println(tmpStr); 
-      Serial.println("===============DiagStatus:");
-      afe44xx.readDiag(afe44xx_diag_status);  // Run diagnostics
-      afe44xx.printDiag(afe44xx_diag_status); // Print diagnostics
-      Serial.println("================================================================================");
-      break;
-    }
-
-    case 'p': { // alarm pins
-      if (commandLen > 1) {
-        tmpuI = strtoul(&command[1], NULL, 10);
-        if (tmpuI >= 0 && tmpuI <= 7) {
-          afe44xx_alarmpins = tmpuI;
-          if (afe44xx.setAlarmpins(afe44xx_alarmpins) == 0) {
-            snprintf(tmpStr, sizeof(tmpStr), "Alarm pins: %u", afe44xx_alarmpins);
-          } else {
-            snprintf(tmpStr, sizeof(tmpStr), "Error: Alarm pins could not be set to: %u", afe44xx_alarmpins);
-          }
+      case 'p': {  // alarm pins
+        if (!numeric_valid || value < 0 || value > 7) {
+          LOGln("Alarm pins out of valid range [0..7]");
+          return;
+        }
+        afe44xx_alarmpins = static_cast<uint8_t>(value);
+        if (afe44xx.setAlarmpins(afe44xx_alarmpins) == 0) {
+          LOGln("Alarm pins: %u", afe44xx_alarmpins);
         } else {
-          strcpy(tmpStr, "Alarm pins out of valid range [0..7]");
+          LOGln("Error: Alarm pins could not be set to: %u", afe44xx_alarmpins);
         }
-      } else {
-        strcpy(tmpStr, "No alarm pin provided. Check help with ?");
+        return;
       }
-      Serial.println(tmpStr);
-      break;
-    }
-
-    case 'm': { // numberr of averages
-      if (commandLen > 1) {
-        tmpuI = strtoul(&command[1], NULL, 10);
-        if (tmpuI >= 1 && tmpuI <= 16) {
-          afe44xx_numAverage = tmpuI;
-          if ((bool)afe44xx_running == true) {
-            afe44xx_running=afe44xx.stop();
-            delay(10);
-            afe44xx_running=afe44xx.start(afe44xx_numAverage);
-            snprintf(tmpStr, sizeof(tmpStr), "Re-started data acquisition with average of %u.", afe44xx_numAverage);  
-          } else {
-            snprintf(tmpStr, sizeof(tmpStr), "System not running, Number of averages set to: %u", afe44xx_numAverage);
-          }
-        } else {
-          strcpy(tmpStr, "Number of averages out of range [1..16]");
-        }
-      } else {
-        strcpy(tmpStr, "No number of averages provided. Check help with ?");
-      }
-      Serial.println(tmpStr);
-      break;
-    }
-
-    case '.': { // toggle running
-      afe44xx_running = !(bool)afe44xx_running;
-      if ((bool)afe44xx_running == false) {
-        afe44xx_running=afe44xx.stop();
-        strcpy(tmpStr, "Stopped data acquisition"); 
-      } else if ((bool)afe44xx_running == true) {
-        afe44xx_running=afe44xx.start(afe44xx_numAverage);
-        snprintf(tmpStr, sizeof(tmpStr), "Started data acquisition with average of %u", afe44xx_numAverage);  
-      }
-      Serial.println(tmpStr);
-      break;
-    }
-
-    default: { // unrecognized command
-      snprintf(tmpStr, sizeof(tmpStr), "Command not available: %s", command); 
-      Serial.println(tmpStr); 
-      break;
+      default:
+        LOGln("Unknown acquisition command");
+        return;
     }
   }
+
+  // Hardware toggles
+  if (cmd1 == 'X') {
+    if (cmd2 != 't' || !numeric_valid || value < 1 || value > 7) {
+      LOGln("Toggle command must be Xt1-Xt7");
+      return;
+    }
+    switch (value) {
+      case 1:
+        afe44xx_sameGain = !afe44xx_sameGain;
+        if (afe44xx.setSameGain(afe44xx_sameGain) == 0) {
+          LOGln("Same gain: %s", afe44xx_sameGain ? "On" : "Off");
+        } else {
+          LOGln("Error: Same gain could not be set to: %s", afe44xx_sameGain ? "On" : "Off");
+        }
+        break;
+      case 2:
+        afe44xx_tristate = !afe44xx_tristate;
+        afe44xx.setTristate(afe44xx_tristate);
+        LOGln("Tri State: %s", afe44xx_tristate ? "On" : "Off");
+        break;
+      case 3:
+        afe44xx_hbridge = !afe44xx_hbridge;
+        afe44xx.setHbridge(afe44xx_hbridge);
+        LOGln("H bridge: %s", afe44xx_hbridge ? "On" : "Off");
+        break;
+      case 4:
+        afe44xx_bypassADC = !afe44xx_bypassADC;
+        afe44xx.bypassADC(afe44xx_bypassADC);
+        LOGln("Bypass ADC: %s", afe44xx_bypassADC ? "On" : "Off");
+        break;
+      case 5:
+        afe44xx_powerRX = !afe44xx_powerRX;
+        afe44xx.setPowerRX(afe44xx_powerRX);
+        LOGln("Power RX: %s", afe44xx_powerRX ? "On" : "Off");
+        break;
+      case 6:
+        afe44xx_powerTX = !afe44xx_powerTX;
+        afe44xx.setPowerTX(afe44xx_powerTX);
+        LOGln("Power TX: %s", afe44xx_powerTX ? "On" : "Off");
+        break;
+      case 7:
+        afe44xx_powerAFE = !afe44xx_powerAFE;
+        afe44xx.setPowerAFE(afe44xx_powerAFE);
+        LOGln("Power AFE: %s", afe44xx_powerAFE ? "On" : "Off");
+        break;
+    }
+    return;
+  }
+
+  // Receiver, transmitter and LED power
+  if (cmd1 == 'R' || cmd1 == 'T' || cmd1 == 'L') {
+    handleReceiverTransmitterCommand(command);
+    return;
+  }
+
+  LOGln("Unknown command");
 }
+

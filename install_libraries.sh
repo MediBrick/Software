@@ -30,19 +30,21 @@ done
 command -v git >/dev/null 2>&1 || { echo "git is required but not installed." >&2; exit 1; }
 
 # Keep in sync with README.md (duplicates removed).
+# Entries are "url" (folder = repository name) or "url|folder".
+# Libraries developed by Urs Utzinger are installed as UUtzinger_<name>.
 REPOS=(
     https://github.com/h2zero/NimBLE-Arduino
-    https://github.com/uutzinger/Arduino_BLESerial
-    https://github.com/uutzinger/Arduino_RingBuffer
-    https://github.com/uutzinger/SavitzkyGolayFilter
-    https://github.com/uutzinger/logger
+    "https://github.com/uutzinger/Arduino_BLESerial|UUtzinger_BLESerial"
+    "https://github.com/uutzinger/Arduino_RingBuffer|UUtzinger_RingBuffer"
+    "https://github.com/uutzinger/SavitzkyGolayFilter|UUtzinger_SavitzkyGolayFilter"
+    "https://github.com/uutzinger/logger|UUtzinger_logger"
     https://github.com/adafruit/Adafruit_SSD1306
     https://github.com/sparkfun/SparkFun_MAX1704x_Fuel_Gauge_Arduino_Library
     https://github.com/adafruit/Adafruit_LC709203F
-    https://github.com/uutzinger/Arduino_MAX30001G
+    "https://github.com/uutzinger/Arduino_MAX30001G|UUtzinger_MAX30001G"
     https://github.com/Sensirion/arduino-i2c-sfm3505
     https://github.com/TronixLab/SFM3300
-    https://github.com/uutzinger/Arduino_AFE44XX
+    "https://github.com/uutzinger/Arduino_AFE44XX|UUtzinger_AFE44XX"
     https://github.com/pschatzmann/arduino-audio-tools
     https://github.com/sparkfun/SparkFun_MicroPressure_Arduino_Library
     https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary
@@ -59,7 +61,21 @@ REPOS=(
     https://github.com/Sensirion/arduino-i2c-sgp41
     https://github.com/Sensirion/gas-index-algorithm
     https://github.com/eNBeWe/MiCS6814-I2C-Library
-    https://github.com/uutzinger/Arduino_DRV8704
+    "https://github.com/uutzinger/Arduino_DRV8704|UUtzinger_DRV8704"
+)
+
+# Old folder names -> current folder names. A git checkout under an old name is renamed;
+# anything else (e.g. Library Manager copies) is only reported as a duplicate, never deleted.
+LEGACY=(
+    Arduino_AFE44XX:UUtzinger_AFE44XX
+    Arduino_BLESerial:UUtzinger_BLESerial
+    Arduino_DRV8704:UUtzinger_DRV8704
+    Arduino_MAX30001G:UUtzinger_MAX30001G
+    Arduino_RingBuffer:UUtzinger_RingBuffer
+    SavitzkyGolayFilter:UUtzinger_SavitzkyGolayFilter
+    logger:UUtzinger_logger
+    BLE_Serial_-_NUS:UUtzinger_BLESerial
+    MAX30001:UUtzinger_MAX30001G
 )
 
 n_new=0; n_ok=0; n_upd=0; n_skip=0; n_fail=0
@@ -69,8 +85,19 @@ echo "Arduino libraries folder: $LIBDIR"
 [ "$CHECK" -eq 1 ] && echo "(check only, no changes will be made)"
 echo
 
-for url in "${REPOS[@]}"; do
-    name="$(basename "$url")"
+if [ "$CHECK" -eq 0 ]; then
+    for pair in "${LEGACY[@]}"; do
+        old="${pair%%:*}"; new="${pair##*:}"
+        if [ -d "$LIBDIR/$old/.git" ] && [ ! -e "$LIBDIR/$new" ]; then
+            echo "[RENAME]   $old -> $new"
+            mv "$LIBDIR/$old" "$LIBDIR/$new"
+        fi
+    done
+fi
+
+for entry in "${REPOS[@]}"; do
+    url="${entry%%|*}"
+    if [ "$entry" = "$url" ]; then name="$(basename "$url")"; else name="${entry##*|}"; fi
     dir="$LIBDIR/$name"
 
     if [ ! -e "$dir" ]; then
@@ -120,6 +147,14 @@ for url in "${REPOS[@]}"; do
         fi
     else
         echo "[SKIP]     $name has local commits not in remote (diverged)"; n_skip=$((n_skip+1))
+    fi
+done
+
+for pair in "${LEGACY[@]}"; do
+    old="${pair%%:*}"; new="${pair##*:}"
+    if [ -e "$LIBDIR/$old" ] && [ -e "$LIBDIR/$new" ]; then
+        echo "[DUPLICATE] $old duplicates $new, remove one of them (Arduino finds both)"
+        n_skip=$((n_skip+1))
     fi
 done
 

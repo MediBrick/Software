@@ -25,19 +25,21 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 $LibDir = if ($env:ARDUINO_LIBS) { $env:ARDUINO_LIBS } else { Join-Path $HOME "Arduino\libraries" }
 
 # Keep in sync with README.md (duplicates removed).
+# Entries are "url" (folder = repository name) or "url|folder".
+# Libraries developed by Urs Utzinger are installed as UUtzinger_<name>.
 $Repos = @(
     "https://github.com/h2zero/NimBLE-Arduino",
-    "https://github.com/uutzinger/Arduino_BLESerial",
-    "https://github.com/uutzinger/Arduino_RingBuffer",
-    "https://github.com/uutzinger/SavitzkyGolayFilter",
-    "https://github.com/uutzinger/logger",
+    "https://github.com/uutzinger/Arduino_BLESerial|UUtzinger_BLESerial",
+    "https://github.com/uutzinger/Arduino_RingBuffer|UUtzinger_RingBuffer",
+    "https://github.com/uutzinger/SavitzkyGolayFilter|UUtzinger_SavitzkyGolayFilter",
+    "https://github.com/uutzinger/logger|UUtzinger_logger",
     "https://github.com/adafruit/Adafruit_SSD1306",
     "https://github.com/sparkfun/SparkFun_MAX1704x_Fuel_Gauge_Arduino_Library",
     "https://github.com/adafruit/Adafruit_LC709203F",
-    "https://github.com/uutzinger/Arduino_MAX30001G",
+    "https://github.com/uutzinger/Arduino_MAX30001G|UUtzinger_MAX30001G",
     "https://github.com/Sensirion/arduino-i2c-sfm3505",
     "https://github.com/TronixLab/SFM3300",
-    "https://github.com/uutzinger/Arduino_AFE44XX",
+    "https://github.com/uutzinger/Arduino_AFE44XX|UUtzinger_AFE44XX",
     "https://github.com/pschatzmann/arduino-audio-tools",
     "https://github.com/sparkfun/SparkFun_MicroPressure_Arduino_Library",
     "https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary",
@@ -54,7 +56,21 @@ $Repos = @(
     "https://github.com/Sensirion/arduino-i2c-sgp41",
     "https://github.com/Sensirion/gas-index-algorithm",
     "https://github.com/eNBeWe/MiCS6814-I2C-Library",
-    "https://github.com/uutzinger/Arduino_DRV8704"
+    "https://github.com/uutzinger/Arduino_DRV8704|UUtzinger_DRV8704"
+)
+
+# Old folder names -> current folder names. A git checkout under an old name is renamed;
+# anything else (e.g. Library Manager copies) is only reported as a duplicate, never deleted.
+$Legacy = @(
+    "Arduino_AFE44XX:UUtzinger_AFE44XX",
+    "Arduino_BLESerial:UUtzinger_BLESerial",
+    "Arduino_DRV8704:UUtzinger_DRV8704",
+    "Arduino_MAX30001G:UUtzinger_MAX30001G",
+    "Arduino_RingBuffer:UUtzinger_RingBuffer",
+    "SavitzkyGolayFilter:UUtzinger_SavitzkyGolayFilter",
+    "logger:UUtzinger_logger",
+    "BLE_Serial_-_NUS:UUtzinger_BLESerial",
+    "MAX30001:UUtzinger_MAX30001G"
 )
 
 $new = 0; $ok = 0; $upd = 0; $skip = 0; $fail = 0
@@ -76,8 +92,19 @@ Write-Host "Arduino libraries folder: $LibDir"
 if ($Check) { Write-Host "(check only, no changes will be made)" }
 Write-Host ""
 
-foreach ($url in $Repos) {
-    $name = $url.TrimEnd('/').Split('/')[-1]
+if (-not $Check) {
+    foreach ($pair in $Legacy) {
+        $old, $newName = $pair.Split(':')
+        if ((Test-Path (Join-Path $LibDir "$old\.git")) -and -not (Test-Path (Join-Path $LibDir $newName))) {
+            Write-Host "[RENAME]   $old -> $newName"
+            Move-Item (Join-Path $LibDir $old) (Join-Path $LibDir $newName)
+        }
+    }
+}
+
+foreach ($entry in $Repos) {
+    $url  = $entry.Split('|')[0]
+    $name = if ($entry.Contains('|')) { $entry.Split('|')[1] } else { $url.TrimEnd('/').Split('/')[-1] }
     $dir  = Join-Path $LibDir $name
 
     if (-not (Test-Path $dir)) {
@@ -129,6 +156,14 @@ foreach ($url in $Repos) {
         }
     } else {
         Write-Host "[SKIP]     $name has local commits not in remote (diverged)"; $skip++
+    }
+}
+
+foreach ($pair in $Legacy) {
+    $old, $newName = $pair.Split(':')
+    if ((Test-Path (Join-Path $LibDir $old)) -and (Test-Path (Join-Path $LibDir $newName))) {
+        Write-Host "[DUPLICATE] $old duplicates $newName, remove one of them (Arduino finds both)"
+        $skip++
     }
 }
 
