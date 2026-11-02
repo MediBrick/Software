@@ -39,6 +39,16 @@ Commands are accepted on both links, the answer goes back to the link the comman
   Useful to check the bridge setup: with a known resistor in place of the thermistor the output should match its value.
 * Voltage mode (`m0`): voltage difference of each bridge in mV, e.g. `-12, 8, 301`.
 
+### Battery, display and button
+
+With I2C on (`w1`) the firmware looks for a MAX17048 battery gauge and a 128x32 SSD1306 OLED (address 0x3C) on the STEMMA QT / QWIIC connector. Both are optional. With I2C off (`w0`) they are switched off because the I2C pins are ADC inputs.
+
+* Screen 1 (default): battery level, charge rate in %/hr and a charge/discharge indicator.
+* Screen 2: run state, unit and the latest value of every thermistor. While measuring it refreshes twice per second, a refresh takes about 12 ms of I2C time.
+* The button connects to GND. Short press switches the screen, a long press (2 s, acted on at release) puts the board into deep sleep, pressing it again wakes the board (it reboots).
+  Button pin: GPIO27 on the SparkFun Thing Plus C (A10), GPIO14 on the Adafruit Feather ESP32-S3 (A4). Both are RTC pins that can wake from deep sleep.
+* `s` shows the battery level and charge rate.
+
 ### Limitations
 
 The ADC runs continuously and every output sample is the average of `bin size` ADC samples ("binning"). The limits that follow from this are:

@@ -31,6 +31,13 @@
 #include "logger.h"
 #define LOG_LEVEL LOG_LEVEL_INFO
 #include <Linereader.h>
+#include <Wire.h>
+#include <Adafruit_MAX1704X.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "driver/rtc_io.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
 
 // AudioTools names used in this sketch
 using audio_tools::AnalogAudioStream;
@@ -72,6 +79,32 @@ using audio_tools::RX_MODE;
 #define MODE_VOLTAGE      0                    // voltage difference of the bridge in mV
 #define MODE_RESISTANCE   1                    // thermistor resistance in Ohm
 #define MODE_TEMPERATURE  2                    // temperature in degrees Celsius
+
+// Button (to GND, internal pull-up): short press switches the display screen, long press goes to deep sleep, a press wakes up.
+// The pin must be an RTC GPIO to wake from deep sleep, and is not used by the thermistors, I2C or a strapping pin.
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  #define BUTTON_PIN 14                        // Feather ESP32-S3: A4
+#else
+  #define BUTTON_PIN 27                        // Thing Plus C: A10 / pin 27
+#endif
+#define BUTTON_DEBOUNCE_US    50000UL
+#define BUTTON_LONG_PRESS_US  2000000UL
+
+// Battery gauge (MAX17048) and OLED (SSD1306) on the I2C bus, only used while I2C is on (w1)
+#define BATTERY_UPDATE_INTERVAL_US       2000000UL
+#define DISPLAY_BATTERY_UPDATE_INTERVAL_US 1000000UL
+#define DISPLAY_DATA_UPDATE_INTERVAL_US   500000UL   // while measuring, a screen refresh takes about 12 ms of I2C time
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT   32
+#define SCREEN_ADDRESS 0x3C
+#define BAT_X 0
+#define BAT_Y 16
+#define BAT_W 64
+#define BAT_H 16
+#define BAT_FULL (BAT_W - 9)
+#define BAT_THICK 10
+#define CHRG_X 1
+#define CHRG_Y 1
 
 // Where a command came from, the answer goes back there
 // (needs to be before the first function, the Arduino build generates function prototypes there)
@@ -230,6 +263,46 @@ bool     measurement_running = false;       // ADC running and data being printe
 bool     adc_running = false;               // ADC driver is started
 bool     data_reporting = true;             // data lines are sent to the enabled links, otherwise the ADC data is discarded
 
+// Battery, display and button
+Adafruit_MAX17048 lipo;                     // battery gauge
+Adafruit_SSD1306  display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+bool     i2c_started = false;               // Wire is running (I2C on)
+bool     battery_available = false;
+bool     display_available = false;
+float    cell_percent = NAN;
+float    charge_rate_percent_per_hour = NAN;
+enum DisplayMode { DISPLAY_BATTERY, DISPLAY_DATA };
+DisplayMode display_mode = DISPLAY_BATTERY;
+bool     display_update_requested = false;
+uint32_t last_display_us = 0;
+uint32_t last_battery_us = 0;
+float    last_values[6];                    // most recent output sample for the display, NAN if not valid
+uint8_t  last_value_count = 0;
+int      button_raw_state = HIGH;           // HIGH: released, LOW: pressed
+int      button_state = HIGH;
+bool     button_ignore_release = false;     // button was still held at boot (wake up), ignore that release
+uint32_t last_button_change_us = 0;
+uint32_t button_pressed_us = 0;
+
+const unsigned char BATTERY_BITMAP[] PROGMEM = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000
+  0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0,  // 00111111, 11111111, 11111111, 11111111, 01111111, 11111111, 11111111, 11110000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00010000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011110
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011110
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,  // 01000000, 00000000, 00000000, 00010000, 00000000, 00000000, 00000000, 00010000
+  0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0,  // 00111111, 11111111, 11111111, 11111111, 11111111, 11111111, 11111111, 11110000
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   // 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000
+};
+
 // Buffer geometry, depends on settings, recalculated by applyAdc()
 size_t   buffer_factor = 1;                 // output samples per read
 size_t   adc_samples   = 0;                 // total ADC samples (not bytes) per read
@@ -373,6 +446,8 @@ void setDefaults(Settings& s) {
   s.sh[0] = DEFAULT_A_COEFF; s.sh[1] = DEFAULT_B_COEFF; s.sh[2] = DEFAULT_C_COEFF;
 }
 
+void syncI2c();   // start or stop battery gauge and display to match the I2C setting
+
 // Try new settings. When stopped they take effect at the next start, otherwise the ADC is restarted.
 // With fit_bin the bin size is moved into the allowed range if the new rate, channels or link limits need it,
 // otherwise the bin size is checked as given. On failure the previous settings stay in place.
@@ -399,6 +474,7 @@ bool applySettings(Settings candidate, bool fit_bin = true) {
     startMeasurement();
     return false;
   }
+  syncI2c();
   return true;
 }
 
@@ -661,6 +737,8 @@ void printSettingsHeader() {
   LOGln("================================================================================");
   LOGln("Board: %s | Running: %s", SYS.name, measurement_running ? "YES" : "NO");
   printDataOutputSettings();
+  if (battery_available) LOGln("Battery: %.0f %% | Charge rate: %.1f %%/hr | Display: %s", cell_percent, charge_rate_percent_per_hour, display_available ? "yes" : "no");
+  else                   LOGln("Battery: not available | Display: %s%s", display_available ? "yes" : "no", settings.i2c ? "" : " (I2C off, w1 to enable)");
   LOGln("--------------------------------------------------------------------------------");
   printSettings(settings);
   LOGln("================================================================================");
@@ -676,6 +754,7 @@ void helpMenu() {
   LOGln("| s: show current settings               | z[s|b|a]: USB, BLE, both, off       |");
   LOGln("| i: show system info and limits         | z[S|B|A]: USB, BLE, both, on        |");
   LOGln("| x: reboot                              |                                     |");
+  LOGln("| Button: short = screen, long = sleep   |                                     |");
   LOGln("|========================================|=====================================|");
   LOGln("| PERSISTENCE                            | START/STOP                          |");
   LOGln("|----------------------------------------|-------------------------------------|");
@@ -963,12 +1042,213 @@ void serialTrigger(const char* mess, int timeout) {
 // Setup
 /* ============================================================================================================================ */
 
+/* ============================================================================================================================ */
+// Battery, display, button and deep sleep
+// Battery gauge and OLED are on the I2C bus, they are only used while I2C is on (w1). With I2C off the pins are ADC inputs.
+/* ============================================================================================================================ */
+
+// Start Wire, battery gauge and display
+void startI2c() {
+#ifdef I2C_POWER
+  gpio_hold_dis((gpio_num_t)I2C_POWER);
+  pinMode(I2C_POWER, OUTPUT);
+  digitalWrite(I2C_POWER, HIGH);   // power to the STEMMA QT connector
+  delay(10);
+#endif
+  Wire.begin();
+  Wire.setClock(400000);
+  i2c_started = true;
+
+  battery_available = lipo.begin();
+  if (battery_available) {
+    cell_percent = lipo.cellPercent();
+    charge_rate_percent_per_hour = lipo.chargeRate();
+    LOGI("MAX17048 initialized");
+  } else {
+    LOGI("MAX17048 not detected, battery monitoring disabled");
+  }
+
+  Wire.beginTransmission(SCREEN_ADDRESS);
+  const bool display_detected = (Wire.endTransmission() == 0);
+  display_available = display_detected && display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS, true, false);
+  if (display_available) {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Display Starting...");
+    display.display();
+    display_update_requested = true;
+  } else {
+    LOGI("SSD1306 not detected, display disabled");
+  }
+}
+
+// Stop battery gauge and display, release the I2C pins
+void stopI2c() {
+  if (display_available) { display.clearDisplay(); display.display(); display.ssd1306_command(SSD1306_DISPLAYOFF); }
+  display_available = false;
+  battery_available = false;
+  if (i2c_started) { Wire.end(); i2c_started = false; }
+}
+
+void syncI2c() {
+  if (settings.i2c && !i2c_started) startI2c();
+  else if (!settings.i2c && i2c_started) stopI2c();
+}
+
+// Output value of one sample for the display, same conversion as the data lines
+float displayValue(int16_t raw, int ch) {
+  if (settings.half_bridge || settings.mode == MODE_VOLTAGE) return (float)raw;
+  const int32_t R = calcres(raw, settings.v_in, settings.r[ch][0], settings.r[ch][1], settings.r[ch][2]);
+  if (settings.mode == MODE_RESISTANCE) return (float)R;
+  const int16_t T = calctemp(R, settings.sh[0], settings.sh[1], settings.sh[2]);
+  return (T < 0 || T > 5000) ? NAN : float(T) / 100.0f;
+}
+
+void drawBatteryIndicator(int x, int y, float percent) {
+  display.drawBitmap(x, y, BATTERY_BITMAP, BAT_W, BAT_H, SSD1306_WHITE);
+  float pct = isfinite(percent) ? percent : 0.0f;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  int width = (int)roundf((pct / 100.0f) * BAT_FULL);
+  display.fillRect(x + 3, y + 3, width, BAT_THICK, SSD1306_WHITE);
+}
+
+// Two boxes, discharge fills the left one, charge the right one, scaled to +-max_percent per hour
+void drawChargingIndicator(int x, int y, int width, int height, float percent_per_hour, float max_percent) {
+  display.drawRect(x, y, width, height, SSD1306_WHITE);
+  display.drawRect(x + width + 1, y, width, height, SSD1306_WHITE);
+  const float rate = isfinite(percent_per_hour) ? percent_per_hour : 0.0f;
+  int inner = (int)roundf((width - 2) * (fabsf(rate) / max_percent));
+  if (inner > width - 2) inner = width - 2;
+  if (inner == 0 && fabsf(rate) > 0.05f) inner = 1;   // small rates stay visible
+  if (rate < 0.0f) display.fillRect(x + width - inner, y + 2, inner, height - 4, SSD1306_WHITE);
+  else             display.fillRect(x + width + 2, y + 2, inner, height - 4, SSD1306_WHITE);
+}
+
+void drawBatteryScreen() {
+  display.clearDisplay();
+  drawBatteryIndicator(BAT_X, BAT_Y, cell_percent);
+  drawChargingIndicator(CHRG_X, CHRG_Y, BAT_W / 2, BAT_H - 2, charge_rate_percent_per_hour, 10.0f);
+  display.setTextSize(1);
+  display.setCursor(BAT_X + BAT_W + 4, CHRG_Y + 3);
+  if (isfinite(charge_rate_percent_per_hour)) { display.print(charge_rate_percent_per_hour, 1); display.print("%/hr"); }
+  else                                        { display.print("rate n/a"); }
+  display.setCursor(BAT_X + BAT_W + 4, BAT_Y + 4);
+  if (isfinite(cell_percent)) { display.print(cell_percent, 0); display.print("%"); }
+  else                        { display.print("bat n/a"); }
+  display.display();
+}
+
+// Run state and unit in the top row, then the latest value of every thermistor (3 rows, a second column for more than 3 values)
+void drawMeasurementScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(measurement_running ? "Measuring" : "Stopped");
+  display.setCursor(70, 0);
+  display.print((settings.half_bridge || settings.mode == MODE_VOLTAGE) ? "mV" : (settings.mode == MODE_RESISTANCE) ? "Ohm" : "degC");
+  const int n = settings.half_bridge ? settings.channels : settings.channels / 2;
+  for (int i = 0; i < n && i < 6; i++) {
+    display.setCursor((i / 3) * 64, 8 * (1 + i % 3));
+    display.print(i + 1);
+    display.print(": ");
+    if (measurement_running && i < last_value_count && isfinite(last_values[i])) {
+      if (settings.mode == MODE_TEMPERATURE && !settings.half_bridge) display.print(last_values[i], 2);
+      else                                                              display.print((long)last_values[i]);
+    } else {
+      display.print("--");
+    }
+  }
+  display.display();
+}
+
+void enterDeepSleep() {
+  LOGln("Long press, entering deep sleep, press the button to wake up");
+  stopMeasurement();
+  if (display_available) display.ssd1306_command(SSD1306_DISPLAYOFF);
+  if (battery_available) { lipo.enableSleep(true); lipo.sleep(true); }
+  Serial.flush();
+  ble.flush();
+  ble.end();
+#ifdef NEOPIXEL_POWER
+  pinMode(NEOPIXEL_POWER, OUTPUT);
+  digitalWrite(NEOPIXEL_POWER, LOW);
+  gpio_hold_en((gpio_num_t)NEOPIXEL_POWER);
+#endif
+#ifdef I2C_POWER
+  digitalWrite(I2C_POWER, LOW);
+  gpio_hold_en((gpio_num_t)I2C_POWER);
+#endif
+#if defined(NEOPIXEL_POWER) || defined(I2C_POWER)
+  gpio_deep_sleep_hold_en();
+#endif
+  // Button is released at this point, wake up when it is pressed (low)
+  rtc_gpio_init((gpio_num_t)BUTTON_PIN);
+  rtc_gpio_set_direction((gpio_num_t)BUTTON_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_PIN);
+  rtc_gpio_pullup_en((gpio_num_t)BUTTON_PIN);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);
+  delay(20);
+  esp_deep_sleep_start();
+}
+
+// Debounced button: short press switches the screen, long press (on release) goes to deep sleep
+void serviceButton(uint32_t now) {
+  const int reading = digitalRead(BUTTON_PIN);
+  if (reading != button_raw_state) { button_raw_state = reading; last_button_change_us = now; }
+  if (button_raw_state == button_state || (now - last_button_change_us) < BUTTON_DEBOUNCE_US) return;
+  button_state = button_raw_state;
+  if (button_state == LOW) { button_pressed_us = now; return; }
+  if (button_ignore_release) { button_ignore_release = false; return; }
+  if ((now - button_pressed_us) >= BUTTON_LONG_PRESS_US) {
+    enterDeepSleep();
+  } else if (display_available) {
+    display_mode = (display_mode == DISPLAY_BATTERY) ? DISPLAY_DATA : DISPLAY_BATTERY;
+    display_update_requested = true;
+  }
+}
+
+// Battery gauge readings and display refresh. A refresh is slow, so while measuring only the slow timer is used.
+void serviceBatteryAndDisplay(uint32_t now) {
+  if (battery_available && (now - last_battery_us) >= BATTERY_UPDATE_INTERVAL_US) {
+    last_battery_us = now;
+    const float rate = lipo.chargeRate();
+    const float pct  = lipo.cellPercent();
+    if (isfinite(rate)) charge_rate_percent_per_hour = rate;
+    if (isfinite(pct))  cell_percent = pct;
+  }
+  if (!display_available) { display_update_requested = false; return; }
+  const uint32_t interval = (display_mode == DISPLAY_DATA) ? DISPLAY_DATA_UPDATE_INTERVAL_US : DISPLAY_BATTERY_UPDATE_INTERVAL_US;
+  if (display_update_requested || (now - last_display_us) >= interval) {
+    last_display_us = now;
+    display_update_requested = false;
+    if (display_mode == DISPLAY_DATA) drawMeasurementScreen();
+    else                              drawBatteryScreen();
+  }
+}
+
 // Serial.setTxBufferSize() exists for UART and hardware CDC, not for TinyUSB CDC (ESP32-S3 with USB mode TinyUSB)
 #if !(defined(CONFIG_IDF_TARGET_ESP32S3) && defined(ARDUINO_USB_MODE) && (ARDUINO_USB_MODE == 0) && ARDUINO_USB_CDC_ON_BOOT)
   #define SERIAL_HAS_TX_BUFFER_SIZE 1
 #endif
 
 void setup() {
+
+  // Wake up from deep sleep: release the pins held during sleep
+  gpio_deep_sleep_hold_dis();
+#ifdef I2C_POWER
+  gpio_hold_dis((gpio_num_t)I2C_POWER);
+#endif
+#ifdef NEOPIXEL_POWER
+  gpio_hold_dis((gpio_num_t)NEOPIXEL_POWER);
+#endif
+  if (rtc_gpio_is_valid_gpio((gpio_num_t)BUTTON_PIN)) rtc_gpio_deinit((gpio_num_t)BUTTON_PIN);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  button_raw_state = button_state = digitalRead(BUTTON_PIN);
+  button_ignore_release = (button_state == LOW);   // still held from the wake up
+  last_button_change_us = micros();
 
   // Serial Interface ------------
 #ifdef SERIAL_HAS_TX_BUFFER_SIZE
@@ -985,9 +1265,14 @@ void setup() {
   setDefaults(settings);
   const bool loaded = readSettings(settings);
   applyLogLevel(settings.log_level);
-  if (settings.serial_baud != BAUDRATE) Serial.updateBaudRate(settings.serial_baud);   // ignored by native USB
+#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT   // native USB CDC has no baud rate
+  if (settings.serial_baud != BAUDRATE) Serial.updateBaudRate(settings.serial_baud);
+#endif
   if (loaded) LOGI("Loaded saved settings");
   else        LOGI("No saved settings, using defaults");
+
+  // Battery and display ----------
+  syncI2c();
 
   // BLE Serial -----------------
   // Task pump: a background task moves the data between the BLE stack and the BLESerial buffers
@@ -1022,10 +1307,24 @@ void loop() {
     processCommand(serial_input_buff, CommandSource::Usb);
   }
 
+  // Button, battery, display ----
+  const uint32_t now_us = micros();
+  serviceButton(now_us);
+  serviceBatteryAndDisplay(now_us);
+
   // Data -----------------------
   if (measurement_running) {
     // Read what the conversion stream has ready (the ADC read does not wait), this can be anything from nothing to several output samples
     size_t bytes_read = convertedStream().readBytes((uint8_t*) process_buffer, buffer_bytes);
+    if (bytes_read > 0 && display_available) {   // latest sample for the display, also when data reporting is off
+      const int values = valuesPerLine(settings);
+      const size_t n_lines = bytes_read / M_BYTES_PER_SAMPLE / values;
+      if (n_lines > 0) {
+        const int16_t* last = (const int16_t*) process_buffer + (n_lines - 1) * values;
+        last_value_count = values > 6 ? 6 : values;
+        for (int ch = 0; ch < last_value_count; ch++) last_values[ch] = displayValue(last[ch], ch);
+      }
+    }
     if (bytes_read > 0 && data_reporting) {   // when data reporting is off the data is read and discarded
       const int num_thermistors = valuesPerLine(settings);   // half bridge: one value per ADC channel, always voltage
       const size_t lines = bytes_read / M_BYTES_PER_SAMPLE / num_thermistors;

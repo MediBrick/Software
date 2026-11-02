@@ -1,6 +1,6 @@
 # Software
 
-### 🔌 **Firmware** & 📋 **Test Software
+### 🔌 **Firmware** & 📋 **Test Software**
 
 - ESP32
     - [📋 📂 ESP32 Hardware Test](/ESP32/Adafruit_FeatherS3_test/Adafruit_FeatherS3_test.ino)
@@ -12,7 +12,7 @@
 - Spirometer
     - Need to write
 - Pulse Oximeter
-    - [📂 Current Firmware](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.ino)
+    - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.ino)
 - Stethoscope
     - Need to write
 - Activity v1
@@ -20,7 +20,7 @@
 - Activity v2
     - Need to write
 - Temperature
-    - [📂 Current Firmware](/MediBrick_Temperature/MediBrick_Temperature_Test/)
+    - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Temperature/MediBrick_Temperature_Test/)
 - Environment
     - 📋 individual test programs
     - Need to write
