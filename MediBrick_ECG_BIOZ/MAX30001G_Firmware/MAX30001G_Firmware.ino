@@ -278,6 +278,10 @@ const uint16_t BIOZ_PREF_SCHEMA_VERSION = 1U;
 const uint16_t BIOZ_SCAN_CAL_VERSION = 1U;
 const uint16_t BIOZ_RELIABILITY_MAP_VERSION = 1U;
 const char BIOZ_PREF_NAMESPACE[] = "max30001g";
+
+// BLE device name, stored in NVS and applied when BLE starts at boot (Ln<name> command)
+const size_t BLE_NAME_MAX = 24U;
+char         ble_name[BLE_NAME_MAX + 1U] = "BLESerialDevice";
 bool bioz_scan_cal_enabled = false;
 float bioz_scan_cal_global_k = BIOZ_SCAN_CAL_DEFAULT_GLOBAL_K;
 
@@ -1278,6 +1282,17 @@ void printPreferencesProfile() {
 // AFE Preferences Profile Save/Load
 //////////////////////////////////////////////////////////////////////////////////////////////
 
+// Read the saved BLE name; independent of the settings schema so it can run before BLE starts
+void loadBleName() {
+  Preferences prefs;
+  if (!prefs.begin(BIOZ_PREF_NAMESPACE, true)) return;
+  if (prefs.isKey("ble_name")) {
+    char tmp[BLE_NAME_MAX + 1U];
+    if (prefs.getString("ble_name", tmp, sizeof(tmp)) > 0U) strlcpy(ble_name, tmp, sizeof(ble_name));
+  }
+  prefs.end();
+}
+
 bool savePreferencesProfile() {
   Preferences prefs;
   if (!prefs.begin(BIOZ_PREF_NAMESPACE, false)) {
@@ -1286,6 +1301,7 @@ bool savePreferencesProfile() {
   }
 
   prefs.putUShort("schema", BIOZ_PREF_SCHEMA_VERSION);
+  prefs.putString("ble_name", ble_name);
   prefs.putUShort("cal_ver", BIOZ_SCAN_CAL_VERSION);
   prefs.putUShort("rel_ver", BIOZ_RELIABILITY_MAP_VERSION);
   prefs.putBool("cal_en", bioz_scan_cal_enabled);
@@ -1389,6 +1405,7 @@ bool loadPreferencesProfile(bool report) {
   }
 
   prefs.end();
+  loadBleName();
   if (report) {
     LOGln("Preferences profile loaded");
     printPreferencesProfile();
@@ -1562,13 +1579,14 @@ void helpMenu() {
   LOGln("|----------------------------------------|-------------------------------------|");
   LOGln("| ?: help screen                         | z: toggle data reporting on/off     |");
   LOGln("| s: show current settings               | z[s|b|a]: USB, BLE, both, off       |");
-  LOGln("| a: apply current settings (re-setup)   |                                     |");
-  LOGln("| h: run health check                    | z[S|B|A]: USB, BLE, both, on        |");
+  LOGln("| a: apply current settings (re-setup)   | z[S|B|A]: USB, BLE, both, on        |");
+  LOGln("| h: run health check                    |                                     |");
   LOGln("| i: print device info                   | c: reset sample counter             |");
   LOGln("| r: print all registers                 | f: FIFO reset                       |");
   LOGln("| t: print status registers              |                                     |");
   LOGln("| p: print config registers              |                                     |");
   LOGln("| x: reboot                              |                                     |");
+  LOGln("| Ln<name>: BLE name (Ps, x to apply)    |                                     |");
   LOGln("================================================================================");
   LOGln("| PERSISTENCE                            | RAM SNAPSHOT                        |");
   LOGln("|----------------------------------------|-------------------------------------|");
@@ -1654,6 +1672,7 @@ void showSettings() {
   LOG("%s", (data_output_mask & DATA_OUT_SERIAL) ? "ON" : "OFF");
   LOG(" | BLE ");
   LOGln("%s", (data_output_mask & DATA_OUT_BLE) ? "ON" : "OFF");
+  LOGln("BLE name: %s (Ln, used after reboot)", ble_name);
   LOG("FIFO Thresholds: ECG ");
   LOG("%u", active_ecg_fifo_threshold);
   LOG(" samples | BIOZ ");
@@ -1999,6 +2018,22 @@ void handleParameterCommand(const char* command) {
   const long value = strtol(numeric_text, &numeric_end, 10);
   const bool numeric_valid =
     numeric_text[0] != '\0' && numeric_end != numeric_text && *numeric_end == '\0';
+
+  // BLE device name, kept as typed; applied at next boot
+  if (cmd1 == 'L' && cmd2 == 'n') {
+    const char* name = &command[2];
+    while (*name == ' ' || *name == '\t') name++;
+    const size_t n = strlen(name);
+    bool ok = n > 0U && n <= BLE_NAME_MAX;
+    for (size_t i = 0; ok && i < n; i++) ok = (name[i] >= 0x20 && name[i] < 0x7F);
+    if (!ok) {
+      LOGln("Usage: Ln<name>, 1..%u printable ASCII characters", static_cast<unsigned>(BLE_NAME_MAX));
+      return;
+    }
+    strlcpy(ble_name, name, sizeof(ble_name));
+    LOGln("BLE name '%s', save with Ps and reboot with x to apply", ble_name);
+    return;
+  }
 
   // Data reporting output commands
   if (cmd1 == 'z') {
@@ -3248,11 +3283,12 @@ void setup() {
 
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, CHANGE);
 
+  loadBleName();  // saved BLE name is needed before BLE starts
   ble.setPumpMode(useTaskPump ? BLESerial::PumpMode::Task : BLESerial::PumpMode::Polling);
 
   if (!ble.begin(
         BLESerial::Mode::Fast,        /*Fast, LowPower, LongRange, Balanced*/
-        "BLESerialDevice",            /*Name*/
+        ble_name,                     /*Name*/
         BLESerial::Security::None     /*None, JustWorks, PasskeyDisplay*/
        )
      )  {

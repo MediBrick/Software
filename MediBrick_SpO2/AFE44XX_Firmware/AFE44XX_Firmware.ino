@@ -151,6 +151,10 @@ bool    afe44xx_useXTAL      = true;  // use external crystal, otherwise provide
 const uint16_t AFE_PREF_SCHEMA_VERSION = 1U;
 const char     AFE_PREF_NAMESPACE[]    = "afe44xx";
 
+// BLE device name, stored in NVS and applied when BLE starts at boot (Ln<name> command)
+const size_t BLE_NAME_MAX = 24U;
+char         ble_name[BLE_NAME_MAX + 1U] = "BLESerialDevice";
+
 struct AfeSettings {
   bool    sameGain;
   int8_t  stage2Gain1, stage2Gain2;
@@ -264,7 +268,7 @@ void setup() {
 
   if (!ble.begin(
         BLESerial::Mode::Fast,        /*Fast, LowPower, LongRange, Balanced*/
-        "BLESerialDevice",            /*Name*/
+        ble_name,                     /*Name*/
         BLESerial::Security::None     /*None, JustWorks, PasskeyDisplay*/
        )
      )  {
@@ -597,11 +601,23 @@ void printPreferencesProfile() {
   LOGln("================================================================================");
 }
 
+// Read the saved BLE name; independent of the settings schema so it can run before BLE starts
+void loadBleName() {
+  Preferences prefs;
+  if (!prefs.begin(AFE_PREF_NAMESPACE, true)) return;
+  if (prefs.isKey("ble_name")) {
+    char tmp[BLE_NAME_MAX + 1U];
+    if (prefs.getString("ble_name", tmp, sizeof(tmp)) > 0U) strlcpy(ble_name, tmp, sizeof(ble_name));
+  }
+  prefs.end();
+}
+
 bool savePreferencesProfile() {
   Preferences prefs;
   if (!prefs.begin(AFE_PREF_NAMESPACE, false)) { LOGln("Preferences save failed: namespace open failed"); return false; }
   AfeSettings c; captureSettings(c);
   prefs.putUShort("schema", AFE_PREF_SCHEMA_VERSION);
+  prefs.putString("ble_name", ble_name);
   prefs.putBool("sameGain", c.sameGain);
   prefs.putChar("s2g1", c.stage2Gain1); prefs.putChar("s2g2", c.stage2Gain2);
   prefs.putShort("cf1", c.CF1); prefs.putShort("cf2", c.CF2);
@@ -657,6 +673,7 @@ bool loadPreferencesProfile(bool report) {
   c.numAverage = prefs.getUChar("navg", c.numAverage); if (c.numAverage < 1 || c.numAverage > 16) c.numAverage = afe44xx_numAverage;
   c.factor = prefs.getFloat("factor", c.factor); if (!(c.factor >= 0.1f && c.factor <= 100.0f)) c.factor = afe44xx_factor;
   prefs.end();
+  loadBleName();
   restoreSettings(c);
   if (report) { LOGln("Settings loaded from NVS"); }
   return true;
@@ -714,13 +731,14 @@ void helpMenu() {
   LOGln("|----------------------------------------|-------------------------------------|");
   LOGln("| ?: help screen                         | z: toggle data reporting on/off     |");
   LOGln("| s: show current settings               | z[s|b|a]: USB, BLE, both, off       |");
-  LOGln("| a: apply current settings (re-setup)   |                                     |");
-  LOGln("| h: run health check                    | z[S|B|A]: USB, BLE, both, on        |");
+  LOGln("| a: apply current settings (re-setup)   | z[S|B|A]: USB, BLE, both, on        |");
+  LOGln("| h: run health check                    |                                     |");
   LOGln("| i: print device info                   | zz: print one sample                |");
   LOGln("| r: print all registers                 | c: reset sample counter             |");
   LOGln("| t: print status (diagnostics)          |                                     |");
   LOGln("| p: print timing registers              |                                     |");
   LOGln("| x: reboot                              |                                     |");
+  LOGln("| Ln<name>: BLE name (Ps, x to apply)    |                                     |");
   LOGln("================================================================================");
   LOGln("| PERSISTENCE                            | RAM SNAPSHOT                        |");
   LOGln("|----------------------------------------|-------------------------------------|");
@@ -794,6 +812,7 @@ void showSettings() {
   LOGln("Running: %s | Data Display: %s", afe44xx_running ? "YES" : "NO", data_reporting ? "ON" : "OFF");
   LOGln("Data Output: USB %s | BLE %s", (data_output_mask & DATA_OUT_SERIAL) ? "ON" : "OFF", (data_output_mask & DATA_OUT_BLE) ? "ON" : "OFF");
   LOGln("Log Level: %d", logGetLevel());
+  LOGln("BLE name: %s (Ln, used after reboot)", ble_name);
   LOGln("Timing factor: %.2f", afe44xx_factor);
   LOGln("Number of averages: %u", afe44xx_numAverage);
   LOGln("Sampling rate: %.1f S/s | Samples: %lu", samplingRate, static_cast<unsigned long>(sample_count));
@@ -1261,6 +1280,22 @@ void handleParameterCommand(const char* command) {
   const long value = strtol(numeric_text, &numeric_end, 10);
   const bool numeric_valid =
     numeric_text[0] != '\0' && numeric_end != numeric_text && *numeric_end == '\0';
+
+  // BLE device name, kept as typed; applied at next boot
+  if (cmd1 == 'L' && cmd2 == 'n') {
+    const char* name = &command[2];
+    while (*name == ' ' || *name == '\t') name++;
+    const size_t n = strlen(name);
+    bool ok = n > 0U && n <= BLE_NAME_MAX;
+    for (size_t i = 0; ok && i < n; i++) ok = (name[i] >= 0x20 && name[i] < 0x7F);
+    if (!ok) {
+      LOGln("Usage: Ln<name>, 1..%u printable ASCII characters", static_cast<unsigned>(BLE_NAME_MAX));
+      return;
+    }
+    strlcpy(ble_name, name, sizeof(ble_name));
+    LOGln("BLE name '%s', save with Ps and reboot with x to apply", ble_name);
+    return;
+  }
 
   // Data reporting output commands
   if (cmd1 == 'z') {
