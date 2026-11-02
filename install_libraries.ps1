@@ -1,5 +1,7 @@
 # Install / update the Arduino libraries needed by the MediBrick firmware.
-# Libraries are cloned with git into ~\Arduino\libraries (override with $env:ARDUINO_LIBS).
+# Libraries are cloned with git into the Arduino sketchbook's libraries folder: the IDE's configured
+# sketchbook if set, else <Documents>\Arduino\libraries (follows OneDrive redirection).
+# Override with $env:ARDUINO_LIBS.
 #
 # For each library:
 #   not installed          -> clone it
@@ -22,7 +24,46 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-$LibDir = if ($env:ARDUINO_LIBS) { $env:ARDUINO_LIBS } else { Join-Path $HOME "Arduino\libraries" }
+# Libraries folder, in order of preference:
+#   1. $env:ARDUINO_LIBS
+#   2. sketchbook configured in the Arduino IDE (arduino-cli.yaml "user:" or preferences.txt "sketchbook.path")
+#   3. <Documents>\Arduino (Documents may be redirected to OneDrive)
+function Get-ArduinoLibDir {
+    if ($env:ARDUINO_LIBS) { return $env:ARDUINO_LIBS }
+
+    $sketchbook = $null
+    $dataDir = Join-Path $env:LOCALAPPDATA "Arduino15"
+
+    $cliYaml = Join-Path $dataDir "arduino-cli.yaml"
+    if (Test-Path $cliYaml) {
+        # Look for "user:" inside the "directories:" block
+        $inDirs = $false
+        foreach ($line in Get-Content $cliYaml) {
+            if ($line -match '^directories:') { $inDirs = $true; continue }
+            if ($inDirs -and $line -match '^\S') { break }
+            if ($inDirs -and $line -match '^\s+user:\s*(.+?)\s*$') {
+                $sketchbook = $Matches[1].Trim('"', "'"); break
+            }
+        }
+    }
+
+    if (-not $sketchbook) {
+        $prefs = Join-Path $dataDir "preferences.txt"
+        if (Test-Path $prefs) {
+            $m = Select-String -Path $prefs -Pattern '^sketchbook\.path=(.+)$' | Select-Object -First 1
+            if ($m) { $sketchbook = $m.Matches[0].Groups[1].Value.Trim() }
+        }
+    }
+
+    if (-not $sketchbook) {
+        $docs = [Environment]::GetFolderPath('MyDocuments')
+        if (-not $docs) { $docs = Join-Path $HOME "Documents" }
+        $sketchbook = Join-Path $docs "Arduino"
+    }
+    return (Join-Path $sketchbook "libraries")
+}
+
+$LibDir = Get-ArduinoLibDir
 
 # Keep in sync with README.md (duplicates removed).
 # Entries are "url" (folder = repository name) or "url|folder".
