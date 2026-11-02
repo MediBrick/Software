@@ -56,7 +56,9 @@ You can find the libraries original repository here:
     - [↗Git 📂 **Savitzky Golay**](https://github.com/uutzinger/SavitzkyGolayFilter)
     - [↗Git 📂 **logger**](https://github.com/uutzinger/logger)
     - [↗Git 📂 Display SSD1306](https://github.com/adafruit/Adafruit_SSD1306)
-    - [↗Git 📂 Battery MAX1704X](https://github.com/sparkfun/SparkFun_MAX1704x_Fuel_Gauge_Arduino_Library)
+    - [↗Git 📂 Display GFX](https://github.com/adafruit/Adafruit-GFX-Library)
+    - [↗Git 📂 Adafruit BusIO](https://github.com/adafruit/Adafruit_BusIO)
+    - [↗Git 📂 Battery MAX1704X](https://github.com/adafruit/Adafruit_MAX1704X)
     - [↗Git 📂 Battery LC709203F](https://github.com/adafruit/Adafruit_LC709203F)
 - ECG & BIOZ
     - [↗Git 📂 **MAX30001G**](https://github.com/uutzinger/Arduino_MAX30001G)
