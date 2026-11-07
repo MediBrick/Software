@@ -12,7 +12,7 @@
 - Spirometer
     - Need to write
 - Pulse Oximeter
-    - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.ino)
+    - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.ino)
 - Stethoscope
     -  [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.ino)
 - Activity v1
@@ -20,7 +20,7 @@
 - Activity v2
     - Need to write
 - Temperature
-    - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Temperature/MediBrick_Temperature_Test/)
+    - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Temperature/Temperature_Firmware/Temperature_Firmware.ino)
 - Environment
     - 📋 individual test programs
     - Need to write
