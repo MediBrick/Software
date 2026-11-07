@@ -14,7 +14,7 @@
 - Pulse Oximeter
     - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.ino)
 - Stethoscope
-    - Need to write
+    -  [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.ino)
 - Activity v1
     - 📋 individual test programs in [folder](/MediBrick_Activity/v1/)
 - Activity v2
