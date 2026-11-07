@@ -54,6 +54,15 @@ using audio_tools::RX_MODE;
 #define BAUDRATE 500000                        // baud rate of the USB serial port (ignored by native USB)
 #define BLE_NAME "MediBrickThermistor"         // default BLE device name
 #define BLE_NAME_MAX 24                        // longest BLE device name the Ln command accepts
+#define BLE_MODE_DEFAULT 0                     // 0 Fast, 1 LowPower, 2 LongRange, 3 Balanced (same order as the library's Mode enum)
+#define BLE_PWR_AUTO 127                       // BLE transmit power: the default of the BLE mode
+#define BLE_PWR_MIN (-24)                      // dBm
+#define BLE_PWR_MAX 9                          // dBm
+#define BLE_STALL_MS 5000                      // BLE output buffer half full and nothing sent for this long: the BLE sender is stuck
+#define BATTERY_LOW_PERCENT 10.0f              // low battery warning below this level
+#define BATTERY_SHUTDOWN_PERCENT 5.0f          // shut down at or below this level or voltage ...
+#define BATTERY_SHUTDOWN_VOLT 3.4f             // (the 3.3 V regulator needs about 3.5 V under load)
+#define BATTERY_SHUTDOWN_HOLD_MS 20000UL       // ... when it lasted this long without USB host and without charging
 
 // Data outputs, bit mask in the settings
 #define DATA_OUT_USB  0x01                     // send data over USB serial
@@ -237,7 +246,10 @@ struct Settings {                // all settings that can be changed by the user
   uint32_t ble_bps;          // sustainable BLE payload in bytes/s, limits the output rate when BLE output is on
   uint8_t  data_out;         // DATA_OUT_USB and/or DATA_OUT_BLE, the limit of every enabled link applies
   uint8_t  log_level;        // LOG_LEVEL_DEBUG .. LOG_LEVEL_NONE
-  char     ble_name[BLE_NAME_MAX + 1];   // BLE device name, applied at boot
+  char     ble_name[BLE_NAME_MAX + 1];   // BLE device name, applied when BLE starts
+  bool     ble_en;           // BLE started at boot
+  uint8_t  ble_mode;         // BLE mode: 0 Fast, 1 LowPower, 2 LongRange, 3 Balanced
+  int8_t   ble_pwr;          // BLE transmit power in dBm (advertising, scanning and connection), BLE_PWR_AUTO = default of the mode
   uint32_t serial_baud;      // baud rate of the USB serial port, applied at boot (ignored by native USB)
   uint8_t  atten;            // index into ATTEN_TABLE
   int32_t  v_in;             // bridge supply in mV
@@ -271,6 +283,7 @@ bool     battery_available = false;
 bool     display_available = false;
 float    cell_percent = NAN;
 float    charge_rate_percent_per_hour = NAN;
+float    cell_voltage = NAN;
 enum DisplayMode { DISPLAY_BATTERY, DISPLAY_DATA };
 DisplayMode display_mode = DISPLAY_BATTERY;
 bool     display_update_requested = false;
@@ -333,6 +346,9 @@ RingBuffer<char, OUT_BUFFER_SIZE> usb_out_buff; // output lines waiting for the 
 RingBuffer<char, OUT_BUFFER_SIZE> ble_out_buff; // output lines waiting for the BLE link
 uint32_t usb_lines_dropped = 0;             // lines lost because the USB buffer was full
 uint32_t ble_lines_dropped = 0;             // lines lost because the BLE buffer was full
+uint32_t ble_bytes_sent = 0;                // bytes written to the BLE link since boot
+uint32_t ble_stall_restarts = 0;            // BLE restarted by the stall watchdog since boot
+bool     ble_on = false;                    // BLE was started (settings.ble_en and begin() succeeded)
 
 /* ============================================================================================================================ */
 // Limits derived from system info and settings
@@ -439,6 +455,9 @@ void setDefaults(Settings& s) {
   s.data_out = DEFAULT_DATA_OUT;
   s.log_level = DEFAULT_LOG_LEVEL;
   strlcpy(s.ble_name, BLE_NAME, sizeof(s.ble_name));
+  s.ble_en   = true;
+  s.ble_mode = BLE_MODE_DEFAULT;
+  s.ble_pwr  = BLE_PWR_AUTO;
   s.serial_baud = BAUDRATE;
   s.atten    = DEFAULT_ATTEN;
   s.v_in     = DEFAULT_V_IN;
@@ -496,6 +515,9 @@ bool saveSettings() {
   prefs.putUChar("dout", settings.data_out);
   prefs.putUChar("loglvl", settings.log_level);
   prefs.putString("ble_name", settings.ble_name);
+  prefs.putBool("ble_en", settings.ble_en);
+  prefs.putUChar("ble_mode", settings.ble_mode);
+  prefs.putChar("ble_pwr", settings.ble_pwr);
   prefs.putUInt("baud", settings.serial_baud);
   prefs.putInt("vin", settings.v_in);
   char key[8];
@@ -527,6 +549,11 @@ bool readSettings(Settings& s) {
   s.data_out = prefs.getUChar("dout", s.data_out);
   s.log_level = prefs.getUChar("loglvl", s.log_level);
   if (prefs.isKey("ble_name")) prefs.getString("ble_name", s.ble_name, sizeof(s.ble_name));
+  s.ble_en   = prefs.getBool("ble_en", s.ble_en);
+  s.ble_mode = prefs.getUChar("ble_mode", s.ble_mode);
+  s.ble_pwr  = prefs.getChar("ble_pwr", s.ble_pwr);
+  if (s.ble_mode > 3) s.ble_mode = BLE_MODE_DEFAULT;
+  if (s.ble_pwr != BLE_PWR_AUTO && (s.ble_pwr < BLE_PWR_MIN || s.ble_pwr > BLE_PWR_MAX)) s.ble_pwr = BLE_PWR_AUTO;
   s.serial_baud = prefs.getUInt("baud", s.serial_baud);
   if (s.serial_baud < 9600 || s.serial_baud > 2000000) s.serial_baud = BAUDRATE;
   s.v_in     = prefs.getInt("vin", s.v_in);
@@ -641,7 +668,7 @@ void queueLine(const char* line, size_t len) {
   if (settings.data_out & DATA_OUT_USB) {
     if (usb_out_buff.push(line, len) != len) usb_lines_dropped++;       // push is all or nothing
   }
-  if ((settings.data_out & DATA_OUT_BLE) && ble.isSubscribed()) {
+  if ((settings.data_out & DATA_OUT_BLE) && ble_on && ble.isSubscribed()) {
     if (ble_out_buff.push(line, len) != len) ble_lines_dropped++;
   }
 }
@@ -661,7 +688,7 @@ void drainUsb() {
 }
 
 void drainBle() {
-  if (!(settings.data_out & DATA_OUT_BLE) || !ble.isSubscribed()) { ble_out_buff.clear(); return; }
+  if (!(settings.data_out & DATA_OUT_BLE) || !ble_on || !ble.isSubscribed()) { ble_out_buff.clear(); return; }
   if (!ble.writeReady()) return;
   size_t room = ble.writeAvailable();
   char chunk[OUT_CHUNK_BYTES];
@@ -669,9 +696,36 @@ void drainBle() {
     size_t m = ble_out_buff.peek(chunk, min(room, sizeof(chunk)));
     size_t w = ble.writeNonBlocking((const uint8_t*)chunk, m);
     ble_out_buff.consume(w);
+    ble_bytes_sent += w;
     room -= w;
     if (w < m) break;
   }
+}
+
+const char* bleModeName(int mode) {
+  static const char* const names[4] = {"Fast", "LowPower", "LongRange", "Balanced"};
+  return names[mode & 3];
+}
+
+// Starts the BLE serial link: advertising and the command and data service. ble_on tells if it runs.
+// A background task moves the data between the BLE stack and the BLESerial buffers.
+void bleStart() {
+  if (ble_on) return;
+  ble.setPumpMode(BLESerial::PumpMode::Task);
+  static const BLESerial::Mode modes[4] = {BLESerial::Mode::Fast, BLESerial::Mode::LowPower, BLESerial::Mode::LongRange, BLESerial::Mode::Balanced};
+  ble_on = ble.begin(modes[settings.ble_mode], settings.ble_name, BLESerial::Security::None);
+  if (!ble_on) { LOGE("BLESerial begin() failed"); return; }   // USB keeps working
+  if (settings.ble_pwr != BLE_PWR_AUTO) ble.setPower(settings.ble_pwr, PWR_ALL);   // instead of the default power of the mode
+}
+
+// Stops the BLE serial link completely: a connected client is disconnected and the radio is switched off.
+void bleStop() {
+  if (!ble_on) return;
+  ble.flush();                                     // let a reply to a command received over BLE go out
+  ble.end();
+  ble_on = false;
+  ble_out_buff.clear();
+  ble_lr.reset();
 }
 
 /* ============================================================================================================================ */
@@ -701,9 +755,12 @@ void printSystemInfo() {
   LOGln("Outputs:");
   LOGln("  USB: %s, %u of %u bytes buffered, %lu lines dropped", (settings.data_out & DATA_OUT_USB) ? "on" : "off",
         (unsigned)usb_out_buff.available(), (unsigned)usb_out_buff.capacity(), (unsigned long)usb_lines_dropped);
-  LOGln("  BLE: %s, %s, %s, %u of %u bytes buffered, %lu lines dropped", (settings.data_out & DATA_OUT_BLE) ? "on" : "off",
-        ble.isConnected() ? "connected" : "not connected", ble.isSubscribed() ? "subscribed" : "not subscribed",
-        (unsigned)ble_out_buff.available(), (unsigned)ble_out_buff.capacity(), (unsigned long)ble_lines_dropped);
+  if (ble_on) LOGln("  BLE radio: mode %s, transmit power advertising %d dBm, connection %d dBm", bleModeName(settings.ble_mode),
+                    (int)NimBLEDevice::getPower(PWR_ADV), (int)NimBLEDevice::getPower(PWR_CONN));
+  LOGln("  BLE: radio %s, data link %s, %s, %u of %u bytes buffered, %lu lines dropped, %lu bytes sent, %lu stall restarts",
+        !ble_on ? "STOPPED" : ble.isConnected() ? "connected" : "ON (advertising)", (settings.data_out & DATA_OUT_BLE) ? "on" : "off",
+        (ble_on && ble.isSubscribed()) ? "subscribed" : "not subscribed",
+        (unsigned)ble_out_buff.available(), (unsigned)ble_out_buff.capacity(), (unsigned long)ble_lines_dropped, (unsigned long)ble_bytes_sent, (unsigned long)ble_stall_restarts);
 }
 
 void printSettings(const Settings& s) {
@@ -715,9 +772,10 @@ void printSettings(const Settings& s) {
   LOGln("  Attenuation      : %u = %s (g)", s.atten, ATTEN_TABLE[s.atten].range);
   LOGln("  Data output      : USB %s, BLE %s (z)", (s.data_out & DATA_OUT_USB) ? "on" : "off", (s.data_out & DATA_OUT_BLE) ? "on" : "off");
   LOGln("  USB limit        : %lu bytes/s (Lu)", (unsigned long)s.usb_bps);
-  LOGln("  BLE limit        : %lu bytes/s (Lb)", (unsigned long)s.ble_bps);
+  LOGln("  BLE limit        : %lu bytes/s (Lr)", (unsigned long)s.ble_bps);
   LOGln("  Serial baud rate : %lu (Ls, used after reboot)", (unsigned long)s.serial_baud);
-  LOGln("  BLE name         : %s (Ln, used after reboot)", s.ble_name);
+  LOGln("  BLE              : %s at boot (Lb), name %s (Ln), mode %s (Lm), power %s (Lt)", s.ble_en ? "ON" : "OFF", s.ble_name, bleModeName(s.ble_mode),
+        s.ble_pwr == BLE_PWR_AUTO ? "default of the mode" : (String(s.ble_pwr) + " dBm").c_str());
   LOGln("  Log level        : %u (l) 0 debug, 1 info, 2 warning, 3 error, 4 critical, 5 none", s.log_level);
   LOGln("  Vin              : %ld mV (v)", (long)s.v_in);
   for (int ch = 0; ch < s.channels / 2; ch++) {
@@ -737,8 +795,10 @@ void printSettingsHeader() {
   LOGln("================================================================================");
   LOGln("Board: %s | Running: %s", SYS.name, measurement_running ? "YES" : "NO");
   printDataOutputSettings();
-  if (battery_available) LOGln("Battery: %.0f %% | Charge rate: %.1f %%/hr | Display: %s", cell_percent, charge_rate_percent_per_hour, display_available ? "yes" : "no");
+  if (battery_available) LOGln("Battery: %.0f %%, %.2f V | Charge rate: %.1f %%/hr | Display: %s", cell_percent, cell_voltage, charge_rate_percent_per_hour, display_available ? "yes" : "no");
   else                   LOGln("Battery: not available | Display: %s%s", display_available ? "yes" : "no", settings.i2c ? "" : " (I2C off, w1 to enable)");
+  LOGln("Battery limits: low warning below %.0f %%, shutdown at %.0f %% or %.1f V after %lu s without USB host and without charging",
+        BATTERY_LOW_PERCENT, BATTERY_SHUTDOWN_PERCENT, BATTERY_SHUTDOWN_VOLT, BATTERY_SHUTDOWN_HOLD_MS / 1000UL);
   LOGln("--------------------------------------------------------------------------------");
   printSettings(settings);
   LOGln("================================================================================");
@@ -774,10 +834,20 @@ void helpMenu() {
   LOGln("| ENGINEERING: ADC                       | ENGINEERING: LINKS AND LOG          |");
   LOGln("|----------------------------------------|-------------------------------------|");
   LOGln("| c<2|4|6>: ADC channels (2 per resistor)| Lu<B/s>: USB data rate limit        |");
-  LOGln("| w<0|1>: I2C off/on (S3 6 ch: off)      | Lb<B/s>: BLE data rate limit        |");
+  LOGln("| w<0|1>: I2C off/on (S3 6 ch: off)      | Lr<B/s>: BLE data rate limit        |");
   LOGln("| g<0-3>: range 0 to 1.1, 1.5, 2.2, 3.9 V| l<0-5>: log level 0 debug .. 5 none |");
-  LOGln("|                                        | Ln<name>: BLE name (needs Ps, x)    |");
   LOGln("|                                        | Ls<baud>: serial baud (needs Ps, x) |");
+  LOGln("================================================================================");
+  LOGln("| ENGINEERING: BLUETOOTH SERIAL (on by default)                                |");
+  LOGln("|------------------------------------------------------------------------------|");
+  LOGln("| Lb<0|1>: BLE stop/start (Ps: boot)     | Lm<0-3>: BLE mode (BLE restarts)    |");
+  LOGln("| Ln<name>: BLE name (Ps, Lb0, Lb1)      |   0 Fast      7.5 ms link  +9 dBm   |");
+  LOGln("| Lt<dBm>: BLE power, -24 to +9 dBm      |   1 LowPower  60-120 ms    -6 dBm   |");
+  LOGln("|   e.g. -12 -9 -6 -3 0 3 6 9            |   2 LongRange coded PHY    +9 dBm   |");
+  LOGln("| Lta: default power of the mode         |   3 Balanced  15-30 ms      0 dBm   |");
+  LOGln("| Lbs: BLE library status (to USB)       | Power shown is the link power;      |");
+  LOGln("| Default: on, mode 0, power auto        | advertising is lower in 1 and 3.    |");
+  LOGln("| A stuck BLE sender restarts BLE.       | Fast and LongRange use the most.    |");
   LOGln("================================================================================");
   LOGln("");
   LOGln("Examples:");
@@ -788,7 +858,7 @@ void helpMenu() {
   LOGln("  z        - Toggle continuous data display");
   LOGln("  r1,9960,9970,9960   - Bridge resistors of thermistor 1");
   LOGln("  h1.1e-3,2.37e-4,7.5e-8 - Steinhart-Hart coefficients");
-  LOGln("c, w, g, f and n restart the ADC and are checked against the limits shown by i. f, c, z, Lu, Lb move the bin size into range if needed.");
+  LOGln("c, w, g, f and n restart the ADC and are checked against the limits shown by i. f, c, z, Lu, Lr move the bin size into range if needed.");
   LOGln("Changes are lost on reboot unless saved with Ps.");
   LOGln("");
 }
@@ -920,8 +990,44 @@ void handleParameterCommand(const char* cmd) {
         LOGln("BLE name '%s', save with Ps and reboot with x to apply", settings.ble_name);
         break;
       }
+      if (cmd[1] == 'b' && cmd[2] == 's' && cmd[3] == '\0') {   // Lbs: status of the BLE library (printed on USB)
+        if (ble_on) ble.printStats(Serial);
+        else        LOGln("BLE is stopped");
+        break;
+      }
+      if (cmd[1] == 'b') {   // BLE stop / start now, the boot default is saved with Ps
+        if (parseNumbers(cmd + 2, v, 1) != 1 || (v[0] != 0 && v[0] != 1)) { LOGln("Usage: Lb0 or Lb1, BLE off/on"); return; }
+        settings.ble_en = (v[0] == 1);
+        if (settings.ble_en) {
+          bleStart();
+          LOGln(ble_on ? "BLE started as '%s', save with Ps to start it at boot" : "BLE start failed", settings.ble_name);
+        } else {
+          LOGln("BLE stopped, save with Ps to keep it off after a reboot");   // before the stop: this may be the reply to a BLE command
+          bleStop();
+        }
+        break;
+      }
+      if (cmd[1] == 'm') {   // BLE mode, BLE is restarted if it runs
+        if (parseNumbers(cmd + 2, v, 1) != 1 || v[0] < 0 || v[0] > 3 || v[0] != floor(v[0])) { LOGln("Usage: Lm0 Fast, Lm1 LowPower, Lm2 LongRange, Lm3 Balanced"); return; }
+        settings.ble_mode = (uint8_t)v[0];
+        LOGln("BLE mode = %s, %s", bleModeName(settings.ble_mode), ble_on ? "BLE restarts" : "save with Ps");   // before the restart: this may be the reply to a BLE command
+        if (ble_on) { bleStop(); bleStart(); }
+        break;
+      }
+      if (cmd[1] == 't') {   // BLE transmit power
+        const bool autoPwr = (cmd[2] == 'a' && cmd[3] == '\0');
+        if (!autoPwr && (parseNumbers(cmd + 2, v, 1) != 1 || v[0] < BLE_PWR_MIN || v[0] > BLE_PWR_MAX || v[0] != floor(v[0]))) {
+          LOGln("Usage: Lt<%d..%d dBm>, Lta = default power of the BLE mode", BLE_PWR_MIN, BLE_PWR_MAX); return;
+        }
+        settings.ble_pwr = autoPwr ? (int8_t)BLE_PWR_AUTO : (int8_t)v[0];
+        if (autoPwr) LOGln("BLE power = default of the mode, %s", ble_on ? "BLE restarts" : "save with Ps");
+        else         LOGln("BLE power = %d dBm, %s", settings.ble_pwr, ble_on ? "applied now" : "save with Ps");
+        if (ble_on && autoPwr) { bleStop(); bleStart(); }
+        else if (ble_on)       ble.setPower(settings.ble_pwr, PWR_ALL);
+        break;
+      }
       const bool usb = (cmd[1] == 'u');
-      if ((!usb && cmd[1] != 'b') || parseNumbers(cmd + 2, v, 1) != 1 || v[0] < 500 || v[0] > 4000000) { LOGln("Usage: Lu<bytes/s> or Lb<bytes/s>, 500..4000000"); return; }
+      if ((!usb && cmd[1] != 'r') || parseNumbers(cmd + 2, v, 1) != 1 || v[0] < 500 || v[0] > 4000000) { LOGln("Usage: Lu<bytes/s> or Lr<bytes/s>, 500..4000000. Lb, Lm, Lt, Lta, Lbs, Ln, Ls: BLE and serial, see ?"); return; }
       if (usb) next.usb_bps = (uint32_t)v[0]; else next.ble_bps = (uint32_t)v[0];
       if (applySettings(next)) { LOGln("%s limit %lu bytes/s", usb ? "USB" : "BLE", (unsigned long)(usb ? settings.usb_bps : settings.ble_bps)); printLimits(settings); }
       break;
@@ -1062,6 +1168,7 @@ void startI2c() {
   battery_available = lipo.begin();
   if (battery_available) {
     cell_percent = lipo.cellPercent();
+    cell_voltage = lipo.cellVoltage();
     charge_rate_percent_per_hour = lipo.chargeRate();
     LOGI("MAX17048 initialized");
   } else {
@@ -1149,6 +1256,7 @@ void drawMeasurementScreen() {
   display.print(measurement_running ? "Measuring" : "Stopped");
   display.setCursor(70, 0);
   display.print((settings.half_bridge || settings.mode == MODE_VOLTAGE) ? "mV" : (settings.mode == MODE_RESISTANCE) ? "Ohm" : "degC");
+  if (battery_available && isfinite(cell_percent) && cell_percent < BATTERY_LOW_PERCENT) { display.setCursor(100, 0); display.print("LOW"); }
   const int n = settings.half_bridge ? settings.channels : settings.channels / 2;
   for (int i = 0; i < n && i < 6; i++) {
     display.setCursor((i / 3) * 64, 8 * (1 + i % 3));
@@ -1164,14 +1272,23 @@ void drawMeasurementScreen() {
   display.display();
 }
 
-void enterDeepSleep() {
-  LOGln("Long press, entering deep sleep, press the button to wake up");
+void enterDeepSleep(const char* reason) {
+  LOGln("%s, entering deep sleep, press the button to wake up", reason);
   stopMeasurement();
-  if (display_available) display.ssd1306_command(SSD1306_DISPLAYOFF);
+  if (display_available) {   // show the reason for a moment
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Sleeping...");
+    display.setCursor(0, 8);
+    display.print(reason);
+    display.display();
+    delay(800);
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+  }
   if (battery_available) { lipo.enableSleep(true); lipo.sleep(true); }
   Serial.flush();
-  ble.flush();
-  ble.end();
+  bleStop();
 #ifdef NEOPIXEL_POWER
   pinMode(NEOPIXEL_POWER, OUTPUT);
   digitalWrite(NEOPIXEL_POWER, LOW);
@@ -1203,7 +1320,7 @@ void serviceButton(uint32_t now) {
   if (button_state == LOW) { button_pressed_us = now; return; }
   if (button_ignore_release) { button_ignore_release = false; return; }
   if ((now - button_pressed_us) >= BUTTON_LONG_PRESS_US) {
-    enterDeepSleep();
+    enterDeepSleep("Long press");
   } else if (display_available) {
     display_mode = (display_mode == DISPLAY_BATTERY) ? DISPLAY_DATA : DISPLAY_BATTERY;
     display_update_requested = true;
@@ -1216,8 +1333,37 @@ void serviceBatteryAndDisplay(uint32_t now) {
     last_battery_us = now;
     const float rate = lipo.chargeRate();
     const float pct  = lipo.cellPercent();
+    const float volt = lipo.cellVoltage();
     if (isfinite(rate)) charge_rate_percent_per_hour = rate;
     if (isfinite(pct))  cell_percent = pct;
+    if (isfinite(volt)) cell_voltage = volt;
+
+    static bool low_logged = false;
+    const bool low = isfinite(cell_percent) && cell_percent < BATTERY_LOW_PERCENT;
+    if (low && !low_logged) LOGW("Low battery: %.0f %%", cell_percent);
+    low_logged = low;
+
+    // Battery empty: shut down to protect the battery and to avoid a brown-out of the 3.3 V rail. Not while a USB host is
+    // plugged in (Serial.isPlugged(), a power-only charger has no host) and not while the battery charges. The condition
+    // has to hold for BATTERY_SHUTDOWN_HOLD_MS. A voltage below 2.5 V is a gauge without battery and is ignored.
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT && defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE == 1
+    const bool usb_host = Serial.isPlugged();
+#else
+    const bool usb_host = false;                    // can not tell with this USB mode or board, only the charge rate is used
+#endif
+    const bool charging = isfinite(charge_rate_percent_per_hour) && charge_rate_percent_per_hour > 0.0f;
+    const bool empty = (isfinite(cell_percent) && cell_percent <= BATTERY_SHUTDOWN_PERCENT) ||
+                       (isfinite(cell_voltage) && cell_voltage > 2.5f && cell_voltage <= BATTERY_SHUTDOWN_VOLT);
+    static uint32_t empty_since_ms = 0;
+    const uint32_t now_ms = millis();
+    if (!empty || usb_host || charging) {
+      empty_since_ms = 0;
+    } else if (empty_since_ms == 0) {
+      empty_since_ms = now_ms | 1UL;                // |1: never 0, 0 means "not empty"
+      LOGW("Battery empty (%.0f %%, %.2f V), shutting down in %lu s unless USB or a charger is connected", cell_percent, cell_voltage, BATTERY_SHUTDOWN_HOLD_MS / 1000UL);
+    } else if (now_ms - empty_since_ms >= BATTERY_SHUTDOWN_HOLD_MS) {
+      enterDeepSleep("Battery empty");
+    }
   }
   if (!display_available) { display_update_requested = false; return; }
   const uint32_t interval = (display_mode == DISPLAY_DATA) ? DISPLAY_DATA_UPDATE_INTERVAL_US : DISPLAY_BATTERY_UPDATE_INTERVAL_US;
@@ -1275,11 +1421,8 @@ void setup() {
   syncI2c();
 
   // BLE Serial -----------------
-  // Task pump: a background task moves the data between the BLE stack and the BLESerial buffers
-  ble.setPumpMode(BLESerial::PumpMode::Task);
-  if (!ble.begin(BLESerial::Mode::Fast, settings.ble_name, BLESerial::Security::None)) {
-    LOGE("BLESerial begin() failed");   // USB keeps working
-  }
+  if (settings.ble_en) bleStart();
+  else                 LOGI("BLE is off (Lb1 starts it)");
 
   // ADC ------------------------
   // Calibrated readings from ESP32 ADC are in units of milli Volts
@@ -1300,7 +1443,7 @@ void setup() {
 void loop() {
 
   // Commands -------------------
-  if (ble_lr.poll(ble, ble_input_buff, sizeof(ble_input_buff))) {
+  if (ble_on && ble_lr.poll(ble, ble_input_buff, sizeof(ble_input_buff))) {
     processCommand(ble_input_buff, CommandSource::Ble);
   }
   if (serial_lr.poll(Serial, serial_input_buff, sizeof(serial_input_buff))) {
@@ -1358,6 +1501,23 @@ void loop() {
   // Output ---------------------
   drainUsb();
   drainBle();
+
+  // BLE watchdog: a client is subscribed, the BLE output buffer is at least half full and no byte went out for BLE_STALL_MS.
+  // The BLE sender is stuck (e.g. after an overload), restart BLE; the client has to connect again.
+  static uint32_t ble_progress_ms = 0, ble_last_bytes = 0;
+  const uint32_t now_ms = millis();
+  if (!ble_on || !ble.isSubscribed() || ble_bytes_sent != ble_last_bytes || ble_out_buff.available() < OUT_BUFFER_SIZE / 2) {
+    ble_last_bytes = ble_bytes_sent;
+    ble_progress_ms = now_ms;
+  } else if (now_ms - ble_progress_ms > BLE_STALL_MS) {
+    LOGW("BLE transmit stalled, restarting BLE (connect the client again)");
+    bleStop();
+    bleStart();
+    ble_stall_restarts++;
+    ble_last_bytes = ble_bytes_sent;
+    ble_progress_ms = now_ms;
+  }
+
   if (!measurement_running) delay(1);   // idle, give other tasks time
   else                      yield();
 }

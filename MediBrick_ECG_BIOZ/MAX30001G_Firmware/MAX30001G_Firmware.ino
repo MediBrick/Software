@@ -105,6 +105,10 @@ constexpr uint32_t BUTTON_LONG_PRESS_US  = 2'000'000U;
 // Battery Indicator
 //////////////////////////////////////////////////////////////////////////////////////////////
 constexpr uint32_t BATTERY_UPDATE_INTERVAL_US = 2'000'000U;
+constexpr float    BATTERY_LOW_PERCENT        = 10.0f;      // low battery warning below this level
+constexpr float    BATTERY_SHUTDOWN_PERCENT   = 5.0f;       // shut down at or below this level or voltage ...
+constexpr float    BATTERY_SHUTDOWN_VOLT      = 3.4f;       // (the 3.3 V regulator needs about 3.5 V under load)
+constexpr uint32_t BATTERY_SHUTDOWN_HOLD_MS   = 20000UL;    // ... when it lasted this long without USB host and without charging
 
 // Serial Communication
 //////////////////////////////////////////////////////////////////////////////////////////////
@@ -116,6 +120,11 @@ const uint32_t LOOP_INTERVAL_US          = 1000U;
 // BLE Serial
 //////////////////////////////////////////////////////////////////////////////////////////////
 constexpr bool useTaskPump               = true;       // set to 'false' to use polling mode
+constexpr uint8_t  BLE_MODE_DEFAULT      = 0U;         // 0 Fast, 1 LowPower, 2 LongRange, 3 Balanced (same order as the library's Mode enum)
+constexpr int8_t   BLE_PWR_AUTO          = 127;        // BLE transmit power: the default of the BLE mode
+constexpr int8_t   BLE_PWR_MIN           = -24;        // dBm
+constexpr int8_t   BLE_PWR_MAX           = 9;          // dBm
+constexpr uint32_t BLE_STALL_MS          = 5000UL;     // BLE output buffer half full and nothing sent for this long: the BLE sender is stuck
 
 // Startup, FIFO, and timeout policy
 //////////////////////////////////////////////////////////////////////////////////////////////
@@ -282,6 +291,13 @@ const char BIOZ_PREF_NAMESPACE[] = "max30001g";
 // BLE device name, stored in NVS and applied when BLE starts at boot (Ln<name> command)
 const size_t BLE_NAME_MAX = 24U;
 char         ble_name[BLE_NAME_MAX + 1U] = "BLESerialDevice";
+// BLE settings, stored in NVS together with the name and applied when BLE starts (Lb, Lm, Lt commands)
+bool         ble_en   = true;                // BLE started at boot
+uint8_t      ble_mode = BLE_MODE_DEFAULT;    // 0 Fast, 1 LowPower, 2 LongRange, 3 Balanced
+int8_t       ble_pwr  = BLE_PWR_AUTO;        // transmit power in dBm (advertising, scanning and connection), BLE_PWR_AUTO = default of the mode
+bool         ble_on   = false;               // BLE was started (ble_en and begin() succeeded)
+uint32_t     ble_bytes_sent     = 0U;        // bytes written to the BLE link since boot
+uint32_t     ble_stall_restarts = 0U;        // BLE restarted by the stall watchdog since boot
 bool bioz_scan_cal_enabled = false;
 float bioz_scan_cal_global_k = BIOZ_SCAN_CAL_DEFAULT_GLOBAL_K;
 
@@ -298,10 +314,18 @@ uint32_t      last_blink_us               = 0;       // last LED blink time (mic
 
 uint32_t last_button_change_us = 0;
 uint32_t button_pressed_us = 0;
-uint32_t last_display_us = 0;
-uint32_t last_battery_us = 0;
-uint32_t display_update_interval_us = DISPLAY_BATTERY_UPDATE_INTERVAL_US;
-bool display_update_requested = false;
+volatile uint32_t display_update_interval_us = DISPLAY_BATTERY_UPDATE_INTERVAL_US;
+volatile bool display_update_requested = false;
+
+// Battery gauge and display are served by their own task, a display refresh takes about 12 ms of I2C time
+// which the main loop can not spend while it empties the AFE FIFOs.
+volatile bool i2c_task_quit = false;   // ask the I2C task to end (before deep sleep)
+volatile bool i2c_task_done = true;
+
+// Heart rate from the latest R-to-R interval, for the display
+volatile float    hr_bpm     = NAN;
+volatile uint32_t hr_last_ms = 0U;     // 0: no valid heart rate
+constexpr uint32_t HR_VALID_MS = 5000U;
 
 //
 float         sampling_rate               = 0.0f;    // measured sampling rate (Hz) for current mode
@@ -403,13 +427,14 @@ LineReader<128>         serial_lr;
 //////////////////////////////////////////////////////////////////////////////////////////////
 Adafruit_MAX17048 lipo;
 bool battery_available = false;
-float charge_rate_percent_per_hour = NAN;
-float cell_percent = NAN;
+volatile float charge_rate_percent_per_hour = NAN;
+volatile float cell_percent = NAN;
+volatile float cell_voltage = NAN;
 
 // Display
 //////////////////////////////////////////////////////////////////////////////////////////////
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-bool display_available = false;
+bool display_available = false;   // I2C is used by the I2C task once started, do not touch Wire from the main loop
 
 // Define different states for OLED
 enum DisplayMode {
@@ -734,6 +759,7 @@ void startMeasurement() {
   RTOR_data.clear();
   BIOZ_spectrum.clear();
   pending_rtor_count = 0U;
+  hr_last_ms = 0U;
 
   // reset Runtime Monitoring State
   const uint32_t now = millis();
@@ -1282,7 +1308,7 @@ void printPreferencesProfile() {
 // AFE Preferences Profile Save/Load
 //////////////////////////////////////////////////////////////////////////////////////////////
 
-// Read the saved BLE name; independent of the settings schema so it can run before BLE starts
+// Read the saved BLE name and BLE settings; independent of the settings schema so it can run before BLE starts
 void loadBleName() {
   Preferences prefs;
   if (!prefs.begin(BIOZ_PREF_NAMESPACE, true)) return;
@@ -1290,6 +1316,11 @@ void loadBleName() {
     char tmp[BLE_NAME_MAX + 1U];
     if (prefs.getString("ble_name", tmp, sizeof(tmp)) > 0U) strlcpy(ble_name, tmp, sizeof(ble_name));
   }
+  ble_en   = prefs.getBool("ble_en", ble_en);
+  ble_mode = prefs.getUChar("ble_mode", ble_mode);
+  ble_pwr  = prefs.getChar("ble_pwr", ble_pwr);
+  if (ble_mode > 3U) ble_mode = BLE_MODE_DEFAULT;
+  if (ble_pwr != BLE_PWR_AUTO && (ble_pwr < BLE_PWR_MIN || ble_pwr > BLE_PWR_MAX)) ble_pwr = BLE_PWR_AUTO;
   prefs.end();
 }
 
@@ -1302,6 +1333,7 @@ bool savePreferencesProfile() {
 
   prefs.putUShort("schema", BIOZ_PREF_SCHEMA_VERSION);
   prefs.putString("ble_name", ble_name);
+  prefs.putBool("ble_en", ble_en); prefs.putUChar("ble_mode", ble_mode); prefs.putChar("ble_pwr", ble_pwr);
   prefs.putUShort("cal_ver", BIOZ_SCAN_CAL_VERSION);
   prefs.putUShort("rel_ver", BIOZ_RELIABILITY_MAP_VERSION);
   prefs.putBool("cal_en", bioz_scan_cal_enabled);
@@ -1586,7 +1618,6 @@ void helpMenu() {
   LOGln("| t: print status registers              |                                     |");
   LOGln("| p: print config registers              |                                     |");
   LOGln("| x: reboot                              |                                     |");
-  LOGln("| Ln<name>: BLE name (Ps, x to apply)    |                                     |");
   LOGln("================================================================================");
   LOGln("| PERSISTENCE                            | RAM SNAPSHOT                        |");
   LOGln("|----------------------------------------|-------------------------------------|");
@@ -1647,6 +1678,17 @@ void helpMenu() {
   LOGln("| l4: critical only                      |                                     |");
   LOGln("| l5: none (silent)                      |                                     |");
   LOGln("================================================================================");
+  LOGln("| ENGINEERING: BLUETOOTH SERIAL (on by default)                                |");
+  LOGln("|------------------------------------------------------------------------------|");
+  LOGln("| Lb<0|1>: BLE stop/start (Ps: boot)     | Lm<0-3>: BLE mode (BLE restarts)    |");
+  LOGln("| Ln<name>: BLE name (Ps, Lb0, Lb1)      |   0 Fast      7.5 ms link  +9 dBm   |");
+  LOGln("| Lt<dBm>: BLE power, -24 to +9 dBm      |   1 LowPower  60-120 ms    -6 dBm   |");
+  LOGln("|   e.g. -12 -9 -6 -3 0 3 6 9            |   2 LongRange coded PHY    +9 dBm   |");
+  LOGln("| Lta: default power of the mode         |   3 Balanced  15-30 ms      0 dBm   |");
+  LOGln("| Lbs: BLE library status (to USB)       | Power shown is the link power;      |");
+  LOGln("| Default: on, mode 0, power auto        | advertising is lower in 1 and 3.    |");
+  LOGln("| A stuck BLE sender restarts BLE.       | Fast and LongRange use the most.    |");
+  LOGln("================================================================================");
   LOGln("");
   LOGln("Examples:");
   LOGln("  m1       - Switch to ECG mode");
@@ -1672,7 +1714,10 @@ void showSettings() {
   LOG("%s", (data_output_mask & DATA_OUT_SERIAL) ? "ON" : "OFF");
   LOG(" | BLE ");
   LOGln("%s", (data_output_mask & DATA_OUT_BLE) ? "ON" : "OFF");
-  LOGln("BLE name: %s (Ln, used after reboot)", ble_name);
+  LOGln("BLE: %s at boot (Lb), name %s (Ln), mode %s (Lm), power %s (Lt)", ble_en ? "ON" : "OFF", ble_name, bleModeName(ble_mode),
+        ble_pwr == BLE_PWR_AUTO ? "default of the mode" : (String(ble_pwr) + " dBm").c_str());
+  LOGln("BLE radio: %s%s, %lu bytes sent, %lu stall restarts", !ble_on ? "STOPPED" : ble.isConnected() ? "connected" : "ON (advertising)",
+        (ble_on && ble.isSubscribed()) ? ", subscribed" : "", (unsigned long)ble_bytes_sent, (unsigned long)ble_stall_restarts);
   LOG("FIFO Thresholds: ECG ");
   LOG("%u", active_ecg_fifo_threshold);
   LOG(" samples | BIOZ ");
@@ -1858,12 +1903,12 @@ void handleGeneralCommand(char cmd) {
       afe.printInfo();
 
       if (battery_available) {
-        cell_percent = lipo.cellPercent();
-        charge_rate_percent_per_hour = lipo.chargeRate();
         LOGln("");
         LOGln("Battery--");
-        LOGln("  Charge state: %.2f%%", cell_percent);
+        LOGln("  Charge state: %.2f%%, %.2f V", cell_percent, cell_voltage);
         LOGln("  Charge rate: %.2f%%/hour", charge_rate_percent_per_hour);
+        LOGln("  Limits: low warning below %.0f %%, shutdown at %.0f %% or %.1f V after %lu s without USB host and without charging",
+              BATTERY_LOW_PERCENT, BATTERY_SHUTDOWN_PERCENT, BATTERY_SHUTDOWN_VOLT, BATTERY_SHUTDOWN_HOLD_MS / 1000UL);
       } else {
         LOGln("");
         LOGln("Battery: not detected");
@@ -1889,9 +1934,9 @@ void handleGeneralCommand(char cmd) {
       LOGln("");
       LOGln("BLE--");
       LOG("  Connected: ");
-      LOGln("%s", ble.isConnected() ? "YES" : "NO");
+      LOGln("%s", (ble_on && ble.isConnected()) ? "YES" : "NO");
       LOG("  Subscribed: ");
-      LOGln("%s", ble.isSubscribed() ? "YES" : "NO");
+      LOGln("%s", (ble_on && ble.isSubscribed()) ? "YES" : "NO");
       LOG("  Pump mode: ");
       LOGln("%s", ble.getPumpMode() == BLESerial::PumpMode::Task ? "Task" : "Polling");
       LOG("  TX buffer free: ");
@@ -2031,7 +2076,52 @@ void handleParameterCommand(const char* command) {
       return;
     }
     strlcpy(ble_name, name, sizeof(ble_name));
-    LOGln("BLE name '%s', save with Ps and reboot with x to apply", ble_name);
+    LOGln("BLE name '%s', save with Ps; Lb0 then Lb1 applies it now", ble_name);
+    return;
+  }
+
+  // BLE status of the library, printed on USB
+  if (cmd1 == 'L' && cmd2 == 'b' && command_len == 3U && command[2] == 's') {
+    if (ble_on) ble.printStats(Serial);
+    else        LOGln("BLE is stopped");
+    return;
+  }
+
+  // BLE stop / start now, the boot default is saved with Ps
+  if (cmd1 == 'L' && cmd2 == 'b') {
+    if (!numeric_valid || (value != 0 && value != 1)) { LOGln("Usage: Lb0 or Lb1, BLE off/on"); return; }
+    ble_en = (value == 1);
+    if (ble_en) {
+      bleStart();
+      LOGln(ble_on ? "BLE started as '%s', save with Ps to start it at boot" : "BLE start failed", ble_name);
+    } else {
+      LOGln("BLE stopped, save with Ps to keep it off after a reboot");   // before the stop: this may be the reply to a BLE command
+      bleStop();
+    }
+    return;
+  }
+
+  // BLE mode, BLE is restarted if it runs
+  if (cmd1 == 'L' && cmd2 == 'm') {
+    if (!numeric_valid || value < 0 || value > 3) { LOGln("Usage: Lm0 Fast, Lm1 LowPower, Lm2 LongRange, Lm3 Balanced"); return; }
+    ble_mode = static_cast<uint8_t>(value);
+    LOGln("BLE mode = %s, %s", bleModeName(ble_mode), ble_on ? "BLE restarts" : "save with Ps");   // before the restart: this may be the reply to a BLE command
+    if (ble_on) { bleStop(); bleStart(); }
+    return;
+  }
+
+  // BLE transmit power
+  if (cmd1 == 'L' && cmd2 == 't') {
+    const bool auto_pwr = (command_len == 3U && command[2] == 'a');
+    if (!auto_pwr && (!numeric_valid || value < BLE_PWR_MIN || value > BLE_PWR_MAX)) {
+      LOGln("Usage: Lt<%d..%d dBm>, Lta = default power of the BLE mode", BLE_PWR_MIN, BLE_PWR_MAX);
+      return;
+    }
+    ble_pwr = auto_pwr ? BLE_PWR_AUTO : static_cast<int8_t>(value);
+    if (auto_pwr) LOGln("BLE power = default of the mode, %s", ble_on ? "BLE restarts" : "save with Ps");
+    else          LOGln("BLE power = %d dBm, %s", ble_pwr, ble_on ? "applied now" : "save with Ps");
+    if (ble_on && auto_pwr) { bleStop(); bleStart(); }
+    else if (ble_on)        ble.setPower(ble_pwr, PWR_ALL);
     return;
   }
 
@@ -2844,7 +2934,7 @@ bool serialBufferWriteLine() {
   }
   // Copy data to the BLE output buffer only when a client is subscribed.
   // drainBleDataOutput() handles writeReady() flow control.
-  if ((data_output_mask & DATA_OUT_BLE) != 0U && ble.isSubscribed()) {
+  if ((data_output_mask & DATA_OUT_BLE) != 0U && ble_on && ble.isSubscribed()) {
     ok = (ble_output_buff.push(serial_line_buff, serial_line_len) == serial_line_len) && ok;
   }
   serial_line_len = 0U;
@@ -2856,6 +2946,10 @@ void drainRtorToPending(bool keep_for_ecg_line) {
   while (RTOR_data.available() > 0) {
     RTOR_data.pop(value);
     rtor_seen_count++;
+    if (value > 0.0f) {
+      hr_bpm = 60000.0f / value;
+      hr_last_ms = millis() | 1U;   // never 0
+    }
     if (keep_for_ecg_line) {
       if (pending_rtor_count < MAX_PENDING_RTOR) {
         pending_rtor_ms[pending_rtor_count++] = value;
@@ -2913,7 +3007,7 @@ size_t drainSerialDataOutput(size_t max_bytes) {
 }
 
 size_t drainBleDataOutput(size_t max_bytes) {
-  if (!ble.isSubscribed()) {
+  if (!ble_on || !ble.isSubscribed()) {
     ble_output_buff.clear();
     return 0U;
   }
@@ -2937,7 +3031,34 @@ size_t drainBleDataOutput(size_t max_bytes) {
     ble_output_buff.consume();
     sent++;
   }
+  ble_bytes_sent += static_cast<uint32_t>(sent);
   return sent;
+}
+
+const char* bleModeName(int mode) {
+  static const char* const names[4] = {"Fast", "LowPower", "LongRange", "Balanced"};
+  return names[mode & 3];
+}
+
+// Starts the BLE serial link: advertising and the command and data service. ble_on tells if it runs.
+void bleStart() {
+  if (ble_on) return;
+  ble.setPumpMode(useTaskPump ? BLESerial::PumpMode::Task : BLESerial::PumpMode::Polling);
+  static const BLESerial::Mode modes[4] = {BLESerial::Mode::Fast, BLESerial::Mode::LowPower, BLESerial::Mode::LongRange, BLESerial::Mode::Balanced};
+  ble_on = ble.begin(modes[ble_mode], ble_name, BLESerial::Security::None);
+  if (!ble_on) { LOGE("BLESerial begin() failed"); return; }   // USB keeps working
+  ble.setLogLevel(LOG_LEVEL);
+  if (ble_pwr != BLE_PWR_AUTO) ble.setPower(ble_pwr, PWR_ALL);   // instead of the default power of the mode
+}
+
+// Stops the BLE serial link completely: a connected client is disconnected and the radio is switched off.
+void bleStop() {
+  if (!ble_on) return;
+  ble.flush();                                     // let a reply to a command received over BLE go out
+  ble.end();
+  ble_on = false;
+  ble_output_buff.clear();
+  ble_lr.reset();
 }
 
 // Write buffered data to enabled outputs in chunks.
@@ -3155,6 +3276,16 @@ void drawMeasurementModeDisplay(OperationMode mode, bool running) {
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print(running ? "Measuring" : "Selected");
+  const uint32_t hr_ms = hr_last_ms;
+  if (running && hr_ms != 0U && (millis() - hr_ms) < HR_VALID_MS && isfinite(hr_bpm)) {
+    display.setCursor(74, 0);
+    display.print("HR ");
+    display.print((int)roundf(hr_bpm));
+  }
+  if (battery_available && isfinite(cell_percent) && cell_percent < BATTERY_LOW_PERCENT) {
+    display.setCursor(110, 0);
+    display.print("LOW");
+  }
 
   const char* mode_name = getDisplayModeName(mode);
   display.setCursor(0, 14);
@@ -3171,8 +3302,64 @@ void drawMeasurementModeDisplay(OperationMode mode, bool running) {
   display.setTextSize(1);
 }
 
-void enterDeepSleep() {
-  LOGln("Long press detected; entering deep sleep...");
+// Owns the I2C bus after setup: reads the battery gauge and refreshes the display
+void i2cTask(void*) {
+  uint32_t last_battery_us = 0U;
+  uint32_t last_display_us = 0U;
+  while (!i2c_task_quit) {
+    const uint32_t now = micros();
+    if (battery_available && (now - last_battery_us) >= BATTERY_UPDATE_INTERVAL_US) {
+      last_battery_us = now;
+      const float rate = lipo.chargeRate();
+      const float pct  = lipo.cellPercent();
+      const float volt = lipo.cellVoltage();
+      if (isfinite(rate)) charge_rate_percent_per_hour = rate;
+      if (isfinite(pct))  cell_percent = pct;
+      if (isfinite(volt)) cell_voltage = volt;
+    }
+    if (display_available && (display_update_requested || (now - last_display_us) >= display_update_interval_us)) {
+      last_display_us = now;
+      display_update_requested = false;
+      if (display_mode == DISPLAY_DATA) {
+        drawMeasurementModeDisplay(current_mode, measurement_running);
+        display.display();
+      } else {
+        display.clearDisplay();
+        drawBatteryIndicator(BAT_X, BAT_Y, cell_percent);
+        drawChargingIndicator(CHRG_X, CHRG_Y, BAT_W / 2, BAT_H - 2,
+                              charge_rate_percent_per_hour, 10.0f);
+        display.setCursor(BAT_X + BAT_W + 4, CHRG_Y + 3);
+        if (isfinite(charge_rate_percent_per_hour)) {
+          display.print(charge_rate_percent_per_hour, 1);
+          display.print("%/hr");
+        } else {
+          display.print("rate n/a");
+        }
+        display.setCursor(BAT_X + BAT_W + 4, BAT_Y + 4);
+        if (isfinite(cell_percent)) {
+          display.print(cell_percent, 0);
+          display.print("%");
+        } else {
+          display.print("bat n/a");
+        }
+        display.display();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  i2c_task_done = true;
+  vTaskDelete(NULL);
+}
+
+// Stop the I2C task and wait until it has ended
+void stopI2cTask() {
+  i2c_task_quit = true;
+  const uint32_t start = millis();
+  while (!i2c_task_done && (millis() - start) < 500UL) delay(5);
+}
+
+void enterDeepSleep(const char* reason) {
+  LOGln("%s, entering deep sleep, press the button to wake up", reason);
 
   // Resetting after end() clears calibration, lead-detection, and channel-enable
   // bits. With EN_ECG, EN_BIOZ, and EN_ULP_LON clear, the MAX30001G enters
@@ -3181,7 +3368,18 @@ void enterDeepSleep() {
   afe.swReset();
   measurement_running = false;
 
-  if (display_available) {
+  stopI2cTask();
+  if (display_available) {                          // the I2C task has ended, the display belongs to this thread now
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Sleeping...");
+    display.setCursor(0, 8);
+    display.print(reason);
+    display.display();
+    delay(800);
+    display.clearDisplay();
+    display.display();
     display.ssd1306_command(SSD1306_DISPLAYOFF);
   }
 
@@ -3191,8 +3389,7 @@ void enterDeepSleep() {
   }
 
   Serial.flush();
-  ble.flush();
-  ble.end();
+  bleStop();
   detachInterrupt(digitalPinToInterrupt(BUTTON_PIN));
 
   digitalWrite(LED_PIN, LOW);
@@ -3228,6 +3425,35 @@ void enterDeepSleep() {
   #else
     LOGE("Deep sleep is only implemented for ESP32 targets");
   #endif
+}
+
+// Low battery warning and shutdown. Called from the main loop (the I2C task reads the battery gauge; the sleep has to
+// stop that task, so it can not be started from there). Shutdown at or below BATTERY_SHUTDOWN_PERCENT or
+// BATTERY_SHUTDOWN_VOLT when it lasted BATTERY_SHUTDOWN_HOLD_MS, without a USB host plugged in (Serial.isPlugged(), a
+// power-only charger has no host) and while the battery is not charging. A voltage below 2.5 V is a gauge without battery.
+void serviceBatteryShutdown(uint32_t now_ms) {
+  if (!battery_available) return;
+  const float pct = cell_percent, volt = cell_voltage, rate = charge_rate_percent_per_hour;
+  static bool low_logged = false;
+  const bool low = isfinite(pct) && pct < BATTERY_LOW_PERCENT;
+  if (low && !low_logged) LOGW("Low battery: %.0f %%", pct);
+  low_logged = low;
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT && defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE == 1
+  const bool usb_host = Serial.isPlugged();
+#else
+  const bool usb_host = false;                      // can not tell with this USB mode or board, only the charge rate is used
+#endif
+  const bool charging = isfinite(rate) && rate > 0.0f;
+  const bool empty = (isfinite(pct) && pct <= BATTERY_SHUTDOWN_PERCENT) || (isfinite(volt) && volt > 2.5f && volt <= BATTERY_SHUTDOWN_VOLT);
+  static uint32_t empty_since_ms = 0;
+  if (!empty || usb_host || charging) {
+    empty_since_ms = 0;
+  } else if (empty_since_ms == 0) {
+    empty_since_ms = now_ms | 1UL;                  // |1: never 0, 0 means "not empty"
+    LOGW("Battery empty (%.0f %%, %.2f V), shutting down in %lu s unless USB or a charger is connected", pct, volt, BATTERY_SHUTDOWN_HOLD_MS / 1000UL);
+  } else if (now_ms - empty_since_ms >= BATTERY_SHUTDOWN_HOLD_MS) {
+    enterDeepSleep("Battery empty");
+  }
 }
 
 /******************************************************************************************************/
@@ -3284,25 +3510,15 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, CHANGE);
 
   loadBleName();  // saved BLE name is needed before BLE starts
-  ble.setPumpMode(useTaskPump ? BLESerial::PumpMode::Task : BLESerial::PumpMode::Polling);
-
-  if (!ble.begin(
-        BLESerial::Mode::Fast,        /*Fast, LowPower, LongRange, Balanced*/
-        ble_name,                     /*Name*/
-        BLESerial::Security::None     /*None, JustWorks, PasskeyDisplay*/
-       )
-     )  {
-    LOGE("BLESerial begin() failed");
-    while (true) delay(1000);
-  }
-
-  ble.setLogLevel(LOG_LEVEL);
+  if (ble_en) bleStart();
+  else        LOGI("BLE is off (Lb1 starts it)");
 
   // LIPO Battery
   // -------------
   battery_available = lipo.begin();
   if (battery_available) {
     cell_percent = lipo.cellPercent();
+    cell_voltage = lipo.cellVoltage();
     charge_rate_percent_per_hour = lipo.chargeRate();
     LOGI("MAX17048 initialized");
   } else {
@@ -3325,6 +3541,13 @@ void setup() {
     display.display();
   } else {
     LOGW("SSD1306 not detected or buffer allocation failed; display disabled");
+  }
+
+  if (battery_available || display_available) {
+    i2c_task_quit = false;
+    i2c_task_done = false;
+    // core 0 (the main loop runs on core 1), low priority
+    xTaskCreatePinnedToCore(i2cTask, "i2c", 4096, nullptr, 1, nullptr, 0);
   }
 
   // AFE Initialization
@@ -3362,21 +3585,6 @@ void setup() {
 void loop() {
   current_time = micros();
 
-  // Battery Update
-  // =======================================================
-  if (battery_available &&
-      (current_time - last_battery_us) >= BATTERY_UPDATE_INTERVAL_US) {
-    last_battery_us = current_time;
-    const float updated_charge_rate = lipo.chargeRate();
-    const float updated_cell_percent = lipo.cellPercent();
-    if (isfinite(updated_charge_rate)) {
-      charge_rate_percent_per_hour = updated_charge_rate;
-    }
-    if (isfinite(updated_cell_percent)) {
-      cell_percent = updated_cell_percent;
-    }
-  }
-
   // Button Update
   // =======================================================
   if (button_edge_pending) {
@@ -3405,7 +3613,7 @@ void loop() {
       led_state = false;
 
       if (press_duration_us >= BUTTON_LONG_PRESS_US) {
-        enterDeepSleep();
+        enterDeepSleep("Long press");
       } else {
         LOGI("Short press; toggling display state");
         display_mode = (display_mode == DISPLAY_BATTERY) ? DISPLAY_DATA : DISPLAY_BATTERY;
@@ -3419,7 +3627,7 @@ void loop() {
 
   // BLE Serial Update
   // =======================================================
-  if (!useTaskPump) {
+  if (!useTaskPump && ble_on) {
     ble.update(); // polling pump
   }
 
@@ -3427,7 +3635,7 @@ void loop() {
   // =======================================================
 
 
-  if (ble_lr.poll(ble, ble_input_buff, sizeof(ble_input_buff))) {
+  if (ble_on && ble_lr.poll(ble, ble_input_buff, sizeof(ble_input_buff))) {
     logSetOutput(ble);
     processCommand(ble_input_buff, CommandSource::Ble);
   }
@@ -3444,50 +3652,28 @@ void loop() {
     checkDataTimeouts();
   }
 
-  // DisplayUpdate
-  // =======================================================
-  // Full-frame SSD1306 updates are slow, so automatic refresh is disabled
-  // during AFE measurement. Button presses still request a one-shot refresh.
-  if (display_available) {
-    const bool timed_display_update = !measurement_running &&
-                                      ((current_time - last_display_us) >= display_update_interval_us);
-    if (display_update_requested || timed_display_update) {
-      last_display_us = current_time;
-      display_update_requested = false;
-      if (display_mode == DISPLAY_DATA) {
-        // Measurement mode display
-        drawMeasurementModeDisplay(current_mode, measurement_running);
-        display.display();
-      } else {
-        // Battery status display
-        display.clearDisplay();
-        drawBatteryIndicator(BAT_X, BAT_Y, cell_percent);
-        drawChargingIndicator(CHRG_X, CHRG_Y, BAT_W / 2, BAT_H - 2,
-                              charge_rate_percent_per_hour, 10.0f);
-        display.setCursor(BAT_X + BAT_W + 4, CHRG_Y + 3);
-        if (isfinite(charge_rate_percent_per_hour)) {
-          display.print(charge_rate_percent_per_hour, 1);
-          display.print("%/hr");
-        } else {
-          display.print("rate n/a");
-        }
-        display.setCursor(BAT_X + BAT_W + 4, BAT_Y + 4);
-        if (isfinite(cell_percent)) {
-          display.print(cell_percent, 0);
-          display.print("%");
-        } else {
-          display.print("bat n/a");
-        }
-        display.display();
-      }
-    }
-  } else {
-    display_update_requested = false;
-  }
-
   // Send data in chunks over serial to avoid blocking
   // =======================================================
   serialOutUpdate();
+
+  // BLE watchdog: a client is subscribed, the BLE output buffer is at least half full and no byte went out for BLE_STALL_MS.
+  // The BLE sender is stuck (e.g. after an overload), restart BLE; the client has to connect again.
+  static uint32_t ble_progress_ms = 0, ble_last_bytes = 0;
+  const uint32_t now_ms = millis();
+  if (!ble_on || !ble.isSubscribed() || ble_bytes_sent != ble_last_bytes || ble_output_buff.available() < SERIAL_OUTPUT_BUFFER_SIZE / 2U) {
+    ble_last_bytes = ble_bytes_sent;
+    ble_progress_ms = now_ms;
+  } else if (now_ms - ble_progress_ms > BLE_STALL_MS) {
+    LOGW("BLE transmit stalled, restarting BLE (connect the client again)");
+    bleStop();
+    bleStart();
+    ble_stall_restarts++;
+    ble_last_bytes = ble_bytes_sent;
+    ble_progress_ms = now_ms;
+  }
+
+  // Battery: low warning and shutdown
+  serviceBatteryShutdown(now_ms);
 
   // Blink LED
   // =========

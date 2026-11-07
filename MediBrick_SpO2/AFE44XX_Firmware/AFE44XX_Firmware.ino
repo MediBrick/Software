@@ -40,6 +40,13 @@
 #include "RingBuffer.h"
 #include <BLESerial.h>
 #include <Linereader.h>
+#include <Wire.h>
+#include <Adafruit_MAX1704X.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "driver/rtc_io.h"
+#include "driver/gpio.h"
+#include "esp_sleep.h"
 
 /******************************************************************************************************/
 // Constants
@@ -61,6 +68,11 @@ const uint32_t LOOP_INTERVAL_US          = 1000U;
 // BLE Serial
 //////////////////////////////////////////////////////////////////////////////////////////////
 constexpr bool useTaskPump               = true;       // set to 'false' to use polling mode
+const uint8_t  BLE_MODE_DEFAULT          = 0U;         // 0 Fast, 1 LowPower, 2 LongRange, 3 Balanced (same order as the library's Mode enum)
+const int8_t   BLE_PWR_AUTO              = 127;        // BLE transmit power: the default of the BLE mode
+const int8_t   BLE_PWR_MIN               = -24;        // dBm
+const int8_t   BLE_PWR_MAX               = 9;          // dBm
+const uint32_t BLE_STALL_MS              = 5000UL;     // BLE output buffer half full and nothing sent for this long: the BLE sender is stuck
 
 // Hardware Pin Connection
 //////////////////////////////////////////////////////////////////////////////////////////////
@@ -75,6 +87,31 @@ constexpr bool useTaskPump               = true;       // set to 'false' to use 
 #define LEDALARM_PIN 26  // LED Alarm pin, this can also be used to show activity of the AFE measurement process
 #define DIAGEND_PIN  27  // This can be used to wait until diagnosis is finished, but it is usually not necessary
 #define PWDN_PIN     25  // power down pin, active low, you can hardwire for always on and turn off LED, Photodiode and other hardware with software
+
+// Button (to GND, internal pull-up): short press switches the display screen, long press goes to deep sleep, a press wakes up.
+// The pin must be an RTC GPIO to wake from deep sleep and must not be used by the AFE (SPI 18/19/23, pins above) or I2C (21/22).
+#define BUTTON_PIN   4
+#define BUTTON_DEBOUNCE_MS    50UL
+#define BUTTON_LONG_PRESS_MS  2000UL
+
+// Battery gauge (MAX17048) and OLED (SSD1306) on the I2C bus
+#define BATTERY_UPDATE_INTERVAL_MS  2000UL
+#define BATTERY_LOW_PERCENT           10.0f      // low battery warning below this level
+#define BATTERY_SHUTDOWN_PERCENT       5.0f      // shut down at or below this level or voltage ...
+#define BATTERY_SHUTDOWN_VOLT          3.4f      // (the 3.3 V regulator needs about 3.5 V under load)
+#define BATTERY_SHUTDOWN_HOLD_MS     20000UL     // ... when it lasted this long without USB host and without charging
+#define DISPLAY_UPDATE_INTERVAL_MS   500UL
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT   32
+#define SCREEN_ADDRESS 0x3C
+#define BAT_X 0           // large battery on the battery screen
+#define BAT_Y 16
+#define BAT_W 64
+#define BAT_H 16
+#define BAT_FULL (BAT_W - 9)
+#define BAT_THICK 10
+#define CHRG_X 1
+#define CHRG_Y 1
 
 /******************************************************************************************************/
 // Global Configuration Variables
@@ -154,6 +191,13 @@ const char     AFE_PREF_NAMESPACE[]    = "afe44xx";
 // BLE device name, stored in NVS and applied when BLE starts at boot (Ln<name> command)
 const size_t BLE_NAME_MAX = 24U;
 char         ble_name[BLE_NAME_MAX + 1U] = "BLESerialDevice";
+// BLE settings, stored in NVS together with the name and applied when BLE starts (Lb, Lm, Lt commands)
+bool         ble_en   = true;                // BLE started at boot
+uint8_t      ble_mode = BLE_MODE_DEFAULT;    // 0 Fast, 1 LowPower, 2 LongRange, 3 Balanced
+int8_t       ble_pwr  = BLE_PWR_AUTO;        // transmit power in dBm (advertising, scanning and connection), BLE_PWR_AUTO = default of the mode
+bool         ble_on   = false;               // BLE was started (ble_en and begin() succeeded)
+uint32_t     ble_bytes_sent     = 0U;        // bytes written to the BLE link since boot
+uint32_t     ble_stall_restarts = 0U;        // BLE restarted by the stall watchdog since boot
 
 struct AfeSettings {
   bool    sameGain;
@@ -167,6 +211,47 @@ struct AfeSettings {
 };
 AfeSettings afe44xx_snapshot;
 bool        afe44xx_snapshot_valid = false;
+
+// Battery, display and button
+//////////////////////////////////////////////////////////////////////////////////////////////
+// The display is refreshed by its own task (a refresh takes about 12 ms of I2C time, the AFE sample rate is 125 S/s or more),
+// the main loop only reads the button.
+Adafruit_MAX17048 lipo;                       // battery gauge
+Adafruit_SSD1306  display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+bool          battery_available = false;
+bool          display_available = false;
+volatile float cell_percent = NAN;
+volatile float charge_rate_percent_per_hour = NAN;
+volatile float cell_voltage = NAN;
+enum DisplayMode : uint8_t { DISPLAY_STATUS, DISPLAY_BATTERY };
+volatile DisplayMode display_mode = DISPLAY_STATUS;
+volatile bool display_update_requested = false;
+volatile bool i2c_task_quit = false;          // ask the I2C task to end (before deep sleep)
+volatile bool i2c_task_done = true;
+int           button_raw_state = HIGH;        // HIGH: released, LOW: pressed
+int           button_state = HIGH;
+bool          button_ignore_release = false;  // button was still held at boot (wake up), ignore that release
+uint32_t      last_button_change_ms = 0;
+uint32_t      button_pressed_ms = 0;
+
+const unsigned char BATTERY_BITMAP[] PROGMEM = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+  0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
 
 // Program Globals
 //////////////////////////////////////////////////////////////////////////////////////////////
@@ -241,10 +326,249 @@ bool serialBufferWriteLine();
 void serialOutUpdate(size_t max_bytes = SERIAL_OUTPUT_CHUNK_BYTES);
 
 /******************************************************************************************************/
+// Battery, display, button and deep sleep
+/******************************************************************************************************/
+
+// Small battery symbol with fill level, w x 8 pixels
+void drawBatterySmall(int x, int y, int w, float percent) {
+  display.drawRect(x, y, w - 2, 8, SSD1306_WHITE);
+  display.fillRect(x + w - 2, y + 2, 2, 4, SSD1306_WHITE);
+  float pct = isfinite(percent) ? percent : 0.0f;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  display.fillRect(x + 2, y + 2, (int)roundf(pct / 100.0f * (w - 6)), 4, SSD1306_WHITE);
+}
+
+// Large battery symbol with fill level
+void drawBatteryIndicator(int x, int y, float percent) {
+  display.drawBitmap(x, y, BATTERY_BITMAP, BAT_W, BAT_H, SSD1306_WHITE);
+  float pct = isfinite(percent) ? percent : 0.0f;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  display.fillRect(x + 3, y + 3, (int)roundf((pct / 100.0f) * BAT_FULL), BAT_THICK, SSD1306_WHITE);
+}
+
+// Two boxes, discharge fills the left one, charge the right one, scaled to +-max_percent per hour
+void drawChargingIndicator(int x, int y, int width, int height, float percent_per_hour, float max_percent) {
+  display.drawRect(x, y, width, height, SSD1306_WHITE);
+  display.drawRect(x + width + 1, y, width, height, SSD1306_WHITE);
+  const float rate = isfinite(percent_per_hour) ? percent_per_hour : 0.0f;
+  int inner = (int)roundf((width - 2) * (fabsf(rate) / max_percent));
+  if (inner > width - 2) inner = width - 2;
+  if (inner == 0 && fabsf(rate) > 0.05f) inner = 1;   // small rates stay visible
+  if (rate < 0.0f) display.fillRect(x + width - inner, y + 2, inner, height - 4, SSD1306_WHITE);
+  else             display.fillRect(x + width + 2, y + 2, inner, height - 4, SSD1306_WHITE);
+}
+
+// Recording state and battery on the top row, data output destination, latest IR and red values
+void drawStatusScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(afe44xx_running ? "Recording" : "Stopped");
+  if (afe44xx_running) display.fillCircle(60, 3, 3, SSD1306_WHITE);   // record dot
+  const float pct = cell_percent;
+  display.setCursor(74, 0);
+  if (battery_available && isfinite(pct)) { display.print(pct, 0); display.print("%"); }
+  else                                    { display.print("--"); }
+  drawBatterySmall(104, 0, 24, battery_available ? pct : NAN);
+  display.setCursor(0, 8);
+  if (battery_available && isfinite(pct) && pct < BATTERY_LOW_PERCENT) display.print("LOW BATTERY");
+  else if (!data_reporting || data_output_mask == 0U) display.print("Data: off");
+  else {
+    display.print("Data:");
+    if (data_output_mask & DATA_OUT_SERIAL) display.print(" USB");
+    if (data_output_mask & DATA_OUT_BLE)    display.print(" BLE");
+  }
+  display.setCursor(0, 16);
+  display.print("IR  ");
+  if (afe44xx_running) display.print((long)irValue); else display.print("--");
+  display.setCursor(0, 24);
+  display.print("Red ");
+  if (afe44xx_running) display.print((long)redValue); else display.print("--");
+  display.display();
+}
+
+void drawBatteryScreen() {
+  display.clearDisplay();
+  drawBatteryIndicator(BAT_X, BAT_Y, cell_percent);
+  drawChargingIndicator(CHRG_X, CHRG_Y, BAT_W / 2, BAT_H - 2, charge_rate_percent_per_hour, 10.0f);
+  display.setTextSize(1);
+  display.setCursor(BAT_X + BAT_W + 4, CHRG_Y + 3);
+  if (isfinite(charge_rate_percent_per_hour)) { display.print(charge_rate_percent_per_hour, 1); display.print("%/hr"); }
+  else                                        { display.print("rate n/a"); }
+  display.setCursor(BAT_X + BAT_W + 4, BAT_Y + 4);
+  if (isfinite(cell_percent)) { display.print(cell_percent, 0); display.print("%"); }
+  else                        { display.print("bat n/a"); }
+  display.display();
+}
+
+// Owns the I2C bus: reads the battery gauge and refreshes the display
+void i2cTask(void*) {
+  uint32_t last_battery_ms = 0;
+  uint32_t last_display_ms = 0;
+  while (!i2c_task_quit) {
+    const uint32_t now = millis();
+    if (battery_available && (now - last_battery_ms) >= BATTERY_UPDATE_INTERVAL_MS) {
+      last_battery_ms = now;
+      const float rate = lipo.chargeRate();
+      const float pct  = lipo.cellPercent();
+      const float volt = lipo.cellVoltage();
+      if (isfinite(rate)) charge_rate_percent_per_hour = rate;
+      if (isfinite(pct))  cell_percent = pct;
+      if (isfinite(volt)) cell_voltage = volt;
+    }
+    if (display_available && (display_update_requested || (now - last_display_ms) >= DISPLAY_UPDATE_INTERVAL_MS)) {
+      last_display_ms = now;
+      display_update_requested = false;
+      if (display_mode == DISPLAY_BATTERY) drawBatteryScreen();
+      else                                 drawStatusScreen();
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  i2c_task_done = true;
+  vTaskDelete(NULL);
+}
+
+// Start Wire, battery gauge, display and the task that serves them
+void startI2c() {
+  Wire.begin();
+  Wire.setClock(400000);
+
+  battery_available = lipo.begin();
+  if (battery_available) {
+    cell_percent = lipo.cellPercent();
+    cell_voltage = lipo.cellVoltage();
+    charge_rate_percent_per_hour = lipo.chargeRate();
+    LOGI("MAX17048 initialized");
+  } else {
+    LOGI("MAX17048 not detected, battery monitoring disabled");
+  }
+
+  Wire.beginTransmission(SCREEN_ADDRESS);
+  const bool display_detected = (Wire.endTransmission() == 0);
+  display_available = display_detected && display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS, true, false);
+  if (display_available) {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("AFE44XX starting...");
+    display.display();
+    display_update_requested = true;
+  } else {
+    LOGI("SSD1306 not detected, display disabled");
+  }
+
+  if (battery_available || display_available) {
+    i2c_task_quit = false;
+    i2c_task_done = false;
+    // core 0 (the AFE data is read in the Arduino loop on core 1), low priority
+    xTaskCreatePinnedToCore(i2cTask, "i2c", 4096, nullptr, 1, nullptr, 0);
+  }
+}
+
+// Stop the I2C task and wait until it has ended
+void stopI2cTask() {
+  i2c_task_quit = true;
+  const uint32_t start = millis();
+  while (!i2c_task_done && (millis() - start) < 500UL) delay(5);
+}
+
+void enterDeepSleep(const char* reason) {
+  LOGln("%s, entering deep sleep, press the button to wake up", reason);
+  if (afe44xx_running) afe44xx_running = afe44xx.stop();
+  data_reporting = false;
+  stopI2cTask();
+  if (display_available) {                          // the I2C task has ended, the display belongs to this thread now
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Sleeping...");
+    display.setCursor(0, 8);
+    display.print(reason);
+    display.display();
+    delay(800);
+    display.clearDisplay();
+    display.display();
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+  }
+  if (battery_available) { lipo.enableSleep(true); lipo.sleep(true); }
+  Serial.flush();
+  bleStop();
+  // keep the AFE powered down during sleep
+  digitalWrite(PWDN_PIN, LOW);
+  gpio_hold_en((gpio_num_t)PWDN_PIN);
+  gpio_deep_sleep_hold_en();
+  // Button is released at this point, wake up when it is pressed (low)
+  rtc_gpio_init((gpio_num_t)BUTTON_PIN);
+  rtc_gpio_set_direction((gpio_num_t)BUTTON_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_PIN);
+  rtc_gpio_pullup_en((gpio_num_t)BUTTON_PIN);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);
+  delay(20);
+  esp_deep_sleep_start();
+}
+
+// Debounced button: short press switches the screen, long press (on release) goes to deep sleep
+void serviceButton(uint32_t now) {
+  const int reading = digitalRead(BUTTON_PIN);
+  if (reading != button_raw_state) { button_raw_state = reading; last_button_change_ms = now; }
+  if (button_raw_state == button_state || (now - last_button_change_ms) < BUTTON_DEBOUNCE_MS) return;
+  button_state = button_raw_state;
+  if (button_state == LOW) { button_pressed_ms = now; return; }
+  if (button_ignore_release) { button_ignore_release = false; return; }
+  if ((now - button_pressed_ms) >= BUTTON_LONG_PRESS_MS) {
+    enterDeepSleep("Long press");
+  } else if (display_available) {
+    display_mode = (display_mode == DISPLAY_STATUS) ? DISPLAY_BATTERY : DISPLAY_STATUS;
+    display_update_requested = true;
+  }
+}
+
+// Low battery warning and shutdown. Called from the main loop (the I2C task reads the battery gauge; the sleep has to
+// stop that task, so it can not be started from there). Shutdown at or below BATTERY_SHUTDOWN_PERCENT or
+// BATTERY_SHUTDOWN_VOLT when it lasted BATTERY_SHUTDOWN_HOLD_MS, without a USB host plugged in (Serial.isPlugged(), a
+// power-only charger has no host) and while the battery is not charging. A voltage below 2.5 V is a gauge without battery.
+void serviceBatteryShutdown(uint32_t now) {
+  if (!battery_available) return;
+  const float pct = cell_percent, volt = cell_voltage, rate = charge_rate_percent_per_hour;
+  static bool low_logged = false;
+  const bool low = isfinite(pct) && pct < BATTERY_LOW_PERCENT;
+  if (low && !low_logged) LOGW("Low battery: %.0f %%", pct);
+  low_logged = low;
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT && defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE == 1
+  const bool usb_host = Serial.isPlugged();
+#else
+  const bool usb_host = false;                      // can not tell with this USB mode or board, only the charge rate is used
+#endif
+  const bool charging = isfinite(rate) && rate > 0.0f;
+  const bool empty = (isfinite(pct) && pct <= BATTERY_SHUTDOWN_PERCENT) || (isfinite(volt) && volt > 2.5f && volt <= BATTERY_SHUTDOWN_VOLT);
+  static uint32_t empty_since_ms = 0;
+  if (!empty || usb_host || charging) {
+    empty_since_ms = 0;
+  } else if (empty_since_ms == 0) {
+    empty_since_ms = now | 1UL;                     // |1: never 0, 0 means "not empty"
+    LOGW("Battery empty (%.0f %%, %.2f V), shutting down in %lu s unless USB or a charger is connected", pct, volt, BATTERY_SHUTDOWN_HOLD_MS / 1000UL);
+  } else if (now - empty_since_ms >= BATTERY_SHUTDOWN_HOLD_MS) {
+    enterDeepSleep("Battery empty");
+  }
+}
+
+/******************************************************************************************************/
 // Setup
 /******************************************************************************************************/
 
 void setup() {
+
+  // Wake up from deep sleep: release the pins held during sleep, set up the button
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)PWDN_PIN);
+  rtc_gpio_deinit((gpio_num_t)BUTTON_PIN);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  button_raw_state = button_state = digitalRead(BUTTON_PIN);
+  button_ignore_release = (button_state == LOW);   // still held from the wake up
+  last_button_change_ms = millis();
 
   // Initialize globals
   // ------------------
@@ -262,21 +586,14 @@ void setup() {
   // Restore saved settings from NVS, if any
   loadPreferencesProfile(false);
 
+  // Battery and display
+  // -------------------
+  startI2c();
+
   // BLE Serial
   // ----------
-  ble.setPumpMode(useTaskPump ? BLESerial::PumpMode::Task : BLESerial::PumpMode::Polling);
-
-  if (!ble.begin(
-        BLESerial::Mode::Fast,        /*Fast, LowPower, LongRange, Balanced*/
-        ble_name,                     /*Name*/
-        BLESerial::Security::None     /*None, JustWorks, PasskeyDisplay*/
-       )
-     )  {
-    LOGE("BLESerial begin() failed");
-    while (true) delay(1000);
-  }
-
-  ble.setLogLevel(LOG_LEVEL);
+  if (ble_en) bleStart();
+  else        LOGI("BLE is off (Lb1 starts it)");
 
   // AFE
   // ------
@@ -378,6 +695,11 @@ void loop() {
 
   currentTime = micros();                                   // keep track of loop time
 
+  // Button
+  // =======================================================
+  serviceButton(millis());
+  serviceBatteryShutdown(millis());
+
   // Obtain new data with ISR
   // =======================================================
   if (afe44xx.afe44xx_data_ready) {
@@ -395,13 +717,13 @@ void loop() {
 
   // BLE Serial Update
   // =======================================================
-  if (!useTaskPump) {
+  if (!useTaskPump && ble_on) {
     ble.update(); // polling pump
   }
 
   // Command Receiver (String)
   // =======================================================
-  if (ble_lr.poll(ble, ble_input_buff, sizeof(ble_input_buff))) {
+  if (ble_on && ble_lr.poll(ble, ble_input_buff, sizeof(ble_input_buff))) {
     logSetOutput(ble);
     processCommand(ble_input_buff, CommandSource::Ble);
   }
@@ -414,6 +736,22 @@ void loop() {
   // Send data in chunks over serial to avoid blocking
   // =======================================================
   serialOutUpdate();
+
+  // BLE watchdog: a client is subscribed, the BLE output buffer is at least half full and no byte went out for BLE_STALL_MS.
+  // The BLE sender is stuck (e.g. after an overload), restart BLE; the client has to connect again.
+  static uint32_t ble_progress_ms = 0, ble_last_bytes = 0;
+  const uint32_t now_ms = millis();
+  if (!ble_on || !ble.isSubscribed() || ble_bytes_sent != ble_last_bytes || ble_output_buff.available() < SERIAL_OUTPUT_BUFFER_SIZE / 2U) {
+    ble_last_bytes = ble_bytes_sent;
+    ble_progress_ms = now_ms;
+  } else if (now_ms - ble_progress_ms > BLE_STALL_MS) {
+    LOGW("BLE transmit stalled, restarting BLE (connect the client again)");
+    bleStop();
+    bleStart();
+    ble_stall_restarts++;
+    ble_last_bytes = ble_bytes_sent;
+    ble_progress_ms = now_ms;
+  }
 
   // Small delay, to maintain loop timing and prevent overwhelming the system
   // ===========
@@ -476,7 +814,7 @@ bool serialBufferWriteLine() {
   }
   // Copy data to the BLE output buffer only when a client is subscribed.
   // drainBleDataOutput() handles writeReady() flow control.
-  if ((data_output_mask & DATA_OUT_BLE) != 0U && ble.isSubscribed()) {
+  if ((data_output_mask & DATA_OUT_BLE) != 0U && ble_on && ble.isSubscribed()) {
     ok = (ble_output_buff.push(serial_line_buff, serial_line_len) == serial_line_len) && ok;
   }
   serial_line_len = 0U;
@@ -504,7 +842,7 @@ size_t drainSerialDataOutput(size_t max_bytes) {
 }
 
 size_t drainBleDataOutput(size_t max_bytes) {
-  if (!ble.isSubscribed()) {
+  if (!ble_on || !ble.isSubscribed()) {
     ble_output_buff.clear();
     return 0U;
   }
@@ -528,7 +866,34 @@ size_t drainBleDataOutput(size_t max_bytes) {
     ble_output_buff.consume();
     sent++;
   }
+  ble_bytes_sent += static_cast<uint32_t>(sent);
   return sent;
+}
+
+const char* bleModeName(int mode) {
+  static const char* const names[4] = {"Fast", "LowPower", "LongRange", "Balanced"};
+  return names[mode & 3];
+}
+
+// Starts the BLE serial link: advertising and the command and data service. ble_on tells if it runs.
+void bleStart() {
+  if (ble_on) return;
+  ble.setPumpMode(useTaskPump ? BLESerial::PumpMode::Task : BLESerial::PumpMode::Polling);
+  static const BLESerial::Mode modes[4] = {BLESerial::Mode::Fast, BLESerial::Mode::LowPower, BLESerial::Mode::LongRange, BLESerial::Mode::Balanced};
+  ble_on = ble.begin(modes[ble_mode], ble_name, BLESerial::Security::None);
+  if (!ble_on) { LOGE("BLESerial begin() failed"); return; }   // USB keeps working
+  ble.setLogLevel(LOG_LEVEL);
+  if (ble_pwr != BLE_PWR_AUTO) ble.setPower(ble_pwr, PWR_ALL);   // instead of the default power of the mode
+}
+
+// Stops the BLE serial link completely: a connected client is disconnected and the radio is switched off.
+void bleStop() {
+  if (!ble_on) return;
+  ble.flush();                                     // let a reply to a command received over BLE go out
+  ble.end();
+  ble_on = false;
+  ble_output_buff.clear();
+  ble_lr.reset();
 }
 
 // Write buffered data to enabled outputs in chunks.
@@ -601,7 +966,7 @@ void printPreferencesProfile() {
   LOGln("================================================================================");
 }
 
-// Read the saved BLE name; independent of the settings schema so it can run before BLE starts
+// Read the saved BLE name and BLE settings; independent of the settings schema so it can run before BLE starts
 void loadBleName() {
   Preferences prefs;
   if (!prefs.begin(AFE_PREF_NAMESPACE, true)) return;
@@ -609,6 +974,11 @@ void loadBleName() {
     char tmp[BLE_NAME_MAX + 1U];
     if (prefs.getString("ble_name", tmp, sizeof(tmp)) > 0U) strlcpy(ble_name, tmp, sizeof(ble_name));
   }
+  ble_en   = prefs.getBool("ble_en", ble_en);
+  ble_mode = prefs.getUChar("ble_mode", ble_mode);
+  ble_pwr  = prefs.getChar("ble_pwr", ble_pwr);
+  if (ble_mode > 3U) ble_mode = BLE_MODE_DEFAULT;
+  if (ble_pwr != BLE_PWR_AUTO && (ble_pwr < BLE_PWR_MIN || ble_pwr > BLE_PWR_MAX)) ble_pwr = BLE_PWR_AUTO;
   prefs.end();
 }
 
@@ -618,6 +988,7 @@ bool savePreferencesProfile() {
   AfeSettings c; captureSettings(c);
   prefs.putUShort("schema", AFE_PREF_SCHEMA_VERSION);
   prefs.putString("ble_name", ble_name);
+  prefs.putBool("ble_en", ble_en); prefs.putUChar("ble_mode", ble_mode); prefs.putChar("ble_pwr", ble_pwr);
   prefs.putBool("sameGain", c.sameGain);
   prefs.putChar("s2g1", c.stage2Gain1); prefs.putChar("s2g2", c.stage2Gain2);
   prefs.putShort("cf1", c.CF1); prefs.putShort("cf2", c.CF2);
@@ -738,7 +1109,7 @@ void helpMenu() {
   LOGln("| t: print status (diagnostics)          |                                     |");
   LOGln("| p: print timing registers              |                                     |");
   LOGln("| x: reboot                              |                                     |");
-  LOGln("| Ln<name>: BLE name (Ps, x to apply)    |                                     |");
+  LOGln("| Button: short = screen, long = sleep   |                                     |");
   LOGln("================================================================================");
   LOGln("| PERSISTENCE                            | RAM SNAPSHOT                        |");
   LOGln("|----------------------------------------|-------------------------------------|");
@@ -780,6 +1151,17 @@ void helpMenu() {
   LOGln("| l4: critical only                      |                                     |");
   LOGln("| l5: none (silent)                      |                                     |");
   LOGln("================================================================================");
+  LOGln("| ENGINEERING: BLUETOOTH SERIAL (on by default)                                |");
+  LOGln("|------------------------------------------------------------------------------|");
+  LOGln("| Lb<0|1>: BLE stop/start (Ps: boot)     | Lm<0-3>: BLE mode (BLE restarts)    |");
+  LOGln("| Ln<name>: BLE name (Ps, Lb0, Lb1)      |   0 Fast      7.5 ms link  +9 dBm   |");
+  LOGln("| Lt<dBm>: BLE power, -24 to +9 dBm      |   1 LowPower  60-120 ms    -6 dBm   |");
+  LOGln("|   e.g. -12 -9 -6 -3 0 3 6 9            |   2 LongRange coded PHY    +9 dBm   |");
+  LOGln("| Lta: default power of the mode         |   3 Balanced  15-30 ms      0 dBm   |");
+  LOGln("| Lbs: BLE library status (to USB)       | Power shown is the link power;      |");
+  LOGln("| Default: on, mode 0, power auto        | advertising is lower in 1 and 3.    |");
+  LOGln("| A stuck BLE sender restarts BLE.       | Fast and LongRange use the most.    |");
+  LOGln("================================================================================");
   LOGln("");
   LOGln("Examples:");
   LOGln("  Rg13     - Set stage 2 gain of LED1 to 3 (Rg2<n> for LED2)");
@@ -812,9 +1194,16 @@ void showSettings() {
   LOGln("Running: %s | Data Display: %s", afe44xx_running ? "YES" : "NO", data_reporting ? "ON" : "OFF");
   LOGln("Data Output: USB %s | BLE %s", (data_output_mask & DATA_OUT_SERIAL) ? "ON" : "OFF", (data_output_mask & DATA_OUT_BLE) ? "ON" : "OFF");
   LOGln("Log Level: %d", logGetLevel());
-  LOGln("BLE name: %s (Ln, used after reboot)", ble_name);
+  LOGln("BLE: %s at boot (Lb), name %s (Ln), mode %s (Lm), power %s (Lt)", ble_en ? "ON" : "OFF", ble_name, bleModeName(ble_mode),
+        ble_pwr == BLE_PWR_AUTO ? "default of the mode" : (String(ble_pwr) + " dBm").c_str());
+  LOGln("BLE radio: %s%s, %lu bytes sent, %lu stall restarts", !ble_on ? "STOPPED" : ble.isConnected() ? "connected" : "ON (advertising)",
+        (ble_on && ble.isSubscribed()) ? ", subscribed" : "", (unsigned long)ble_bytes_sent, (unsigned long)ble_stall_restarts);
   LOGln("Timing factor: %.2f", afe44xx_factor);
   LOGln("Number of averages: %u", afe44xx_numAverage);
+  if (battery_available) LOGln("Battery: %.0f %%, %.2f V | Charge rate: %.1f %%/hr | Display: %s", (float)cell_percent, (float)cell_voltage, (float)charge_rate_percent_per_hour, display_available ? "yes" : "no");
+  else                   LOGln("Battery: not available | Display: %s", display_available ? "yes" : "no");
+  LOGln("Battery limits: low warning below %.0f %%, shutdown at %.0f %% or %.1f V after %lu s without USB host and without charging",
+        BATTERY_LOW_PERCENT, BATTERY_SHUTDOWN_PERCENT, BATTERY_SHUTDOWN_VOLT, BATTERY_SHUTDOWN_HOLD_MS / 1000UL);
   LOGln("Sampling rate: %.1f S/s | Samples: %lu", samplingRate, static_cast<unsigned long>(sample_count));
   LOGln("--Receiver--");
   LOGln("Same Gain: %s", afe44xx_sameGain ? "On" : "Off");
@@ -937,9 +1326,9 @@ void handleGeneralCommand(char cmd) {
       LOGln("");
       LOGln("BLE--");
       LOG("  Connected: ");
-      LOGln("%s", ble.isConnected() ? "YES" : "NO");
+      LOGln("%s", (ble_on && ble.isConnected()) ? "YES" : "NO");
       LOG("  Subscribed: ");
-      LOGln("%s", ble.isSubscribed() ? "YES" : "NO");
+      LOGln("%s", (ble_on && ble.isSubscribed()) ? "YES" : "NO");
       LOG("  Pump mode: ");
       LOGln("%s", ble.getPumpMode() == BLESerial::PumpMode::Task ? "Task" : "Polling");
       LOG("  TX buffer free: ");
@@ -1077,16 +1466,16 @@ void handleReceiverTransmitterCommand(const char* command) {
             if (command[2] == '1') {
               afe44xx_stage2Gain1 = tmpI;
               if (afe44xx.setSecondStageGain(afe44xx_stage2Gain1, true, 1) == 0) {
-                snprintf(tmpStr, sizeof(tmpStr), "Stage 2 gain LED1 set to: %d", tmpI);
+                snprintf(tmpStr, sizeof(tmpStr), "Stage 2 gain LED1 set to: %ld", tmpI);
               } else {
-                snprintf(tmpStr, sizeof(tmpStr), "Error: Stage 2 gain LED1 could not be set to: %d", tmpI);              
+                snprintf(tmpStr, sizeof(tmpStr), "Error: Stage 2 gain LED1 could not be set to: %ld", tmpI);              
               }
             } else if (command[2] == '2') {
               afe44xx_stage2Gain2 = tmpI;
               if (afe44xx.setSecondStageGain(afe44xx_stage2Gain2, true, 2) == 2) {
-                snprintf(tmpStr, sizeof(tmpStr), "Stage 2 gain LED2 set to: %d", tmpI);
+                snprintf(tmpStr, sizeof(tmpStr), "Stage 2 gain LED2 set to: %ld", tmpI);
               } else {
-                snprintf(tmpStr, sizeof(tmpStr), "Error: Stage 2 gain LED2 could not be set to: %d", tmpI);              
+                snprintf(tmpStr, sizeof(tmpStr), "Error: Stage 2 gain LED2 could not be set to: %ld", tmpI);              
               
               }
             } else {
@@ -1102,16 +1491,16 @@ void handleReceiverTransmitterCommand(const char* command) {
             if (command[2] == '1') {
               afe44xx_CF1 = tmpI;
               if (afe44xx.setFirstStageFeedbackCapacitor(afe44xx_CF1,1) == 0) {
-                snprintf(tmpStr, sizeof(tmpStr), "Feedback capacitor LED1 set to: %d", tmpI);
+                snprintf(tmpStr, sizeof(tmpStr), "Feedback capacitor LED1 set to: %ld", tmpI);
               } else {
-                snprintf(tmpStr, sizeof(tmpStr), "Error: Feedback capacitor LED1 could not be set to: %d", tmpI); 
+                snprintf(tmpStr, sizeof(tmpStr), "Error: Feedback capacitor LED1 could not be set to: %ld", tmpI); 
               }
             } else if (command[2] == '2') {
               afe44xx_CF2 = tmpI; 
               if (afe44xx.setFirstStageFeedbackCapacitor(afe44xx_CF2,2) == 0) {
-                snprintf(tmpStr, sizeof(tmpStr), "Feedback capacitor LED2 set to: %d", tmpI);
+                snprintf(tmpStr, sizeof(tmpStr), "Feedback capacitor LED2 set to: %ld", tmpI);
               } else {
-                snprintf(tmpStr, sizeof(tmpStr), "Error: Feedback capacitor LED2 could not be set to: %d", tmpI);
+                snprintf(tmpStr, sizeof(tmpStr), "Error: Feedback capacitor LED2 could not be set to: %ld", tmpI);
               } 
             } else {
               strcpy(tmpStr, "Invalid LED number for command 'C'");
@@ -1126,16 +1515,16 @@ void handleReceiverTransmitterCommand(const char* command) {
             if (command[2] == '1') {
                 afe44xx_RF1 = tmpI;
                 if (afe44xx.setFirstStageFeedbackResistor(afe44xx_RF1,1)==0) {
-                  snprintf(tmpStr, sizeof(tmpStr), "Feedback resistor LED1 set to: %d", tmpI);
+                  snprintf(tmpStr, sizeof(tmpStr), "Feedback resistor LED1 set to: %ld", tmpI);
                 } else {
-                  snprintf(tmpStr, sizeof(tmpStr), "Error: Feedback resistor LED1 could not be set to: %d", tmpI);
+                  snprintf(tmpStr, sizeof(tmpStr), "Error: Feedback resistor LED1 could not be set to: %ld", tmpI);
                 }
             } else if (command[2] == '2') {
                 afe44xx_RF2 = tmpI;
                 if (afe44xx.setFirstStageFeedbackResistor(afe44xx_RF2,2)==0) {
-                  snprintf(tmpStr, sizeof(tmpStr), "Feedback resistor LED2 set to: %d", tmpI);
+                  snprintf(tmpStr, sizeof(tmpStr), "Feedback resistor LED2 set to: %ld", tmpI);
                 } else {
-                  snprintf(tmpStr, sizeof(tmpStr), "Error: Feedback resistor LED2 could not be set to: %d", tmpI);
+                  snprintf(tmpStr, sizeof(tmpStr), "Error: Feedback resistor LED2 could not be set to: %ld", tmpI);
                 } 
             } else {
               strcpy(tmpStr, "Invalid LED number for command 'R'");
@@ -1148,9 +1537,9 @@ void handleReceiverTransmitterCommand(const char* command) {
             if ( (tmpI >= 0) && (tmpI<=1)) {
               afe44xx_Fc = tmpI;
               if (afe44xx.setFirstStageCutOffFrequency(afe44xx_Fc) == 0) {
-                snprintf(tmpStr, sizeof(tmpStr), "Edge frequency set to: %d", tmpI);
+                snprintf(tmpStr, sizeof(tmpStr), "Edge frequency set to: %ld", tmpI);
               } else {
-                snprintf(tmpStr, sizeof(tmpStr), "Error: Edge frequency could not be set to: %d", tmpI);
+                snprintf(tmpStr, sizeof(tmpStr), "Error: Edge frequency could not be set to: %ld", tmpI);
               }
             } else {
               snprintf(tmpStr, sizeof(tmpStr), "Edge frequency ouside of range [0,1]");
@@ -1160,9 +1549,9 @@ void handleReceiverTransmitterCommand(const char* command) {
             if ( (tmpI >= 0) && (tmpI<=10)) {
               afe44xx_CAmbient=tmpI;
               if (afe44xx.setCancellationCurrent(afe44xx_CAmbient) == 0) {
-                snprintf(tmpStr, sizeof(tmpStr), "Ambient background current set to: %d", tmpI);
+                snprintf(tmpStr, sizeof(tmpStr), "Ambient background current set to: %ld", tmpI);
               } else {
-                snprintf(tmpStr, sizeof(tmpStr), "Error: Ambient background could not be set to: %d", tmpI);
+                snprintf(tmpStr, sizeof(tmpStr), "Error: Ambient background could not be set to: %ld", tmpI);
               }
             } else {
               snprintf(tmpStr, sizeof(tmpStr), "Ambient background current outside of range");
@@ -1193,9 +1582,9 @@ void handleReceiverTransmitterCommand(const char* command) {
           if ( (tmpI >= 0) && (tmpI<=3)) {
             afe44xx_txRefVoltage =  tmpI; 
             if (afe44xx.setLEDdriver(afe44xx_txRefVoltage,afe44xx_range) == 0) {
-              snprintf(tmpStr, sizeof(tmpStr), "Reference voltage set to: %d", tmpI);
+              snprintf(tmpStr, sizeof(tmpStr), "Reference voltage set to: %ld", tmpI);
             } else {
-              snprintf(tmpStr, sizeof(tmpStr), "Error: Reference voltage could not be set to: %d", tmpI);
+              snprintf(tmpStr, sizeof(tmpStr), "Error: Reference voltage could not be set to: %ld", tmpI);
             }
           } else {
             snprintf(tmpStr, sizeof(tmpStr), "Reference voltage outside of range [0..3]");
@@ -1206,9 +1595,9 @@ void handleReceiverTransmitterCommand(const char* command) {
           if ( (tmpI >= 0) && (tmpI<=3)) {
             afe44xx_range = tmpI;
             if (afe44xx.setLEDdriver(afe44xx_txRefVoltage,afe44xx_range) == 0) {
-              snprintf(tmpStr, sizeof(tmpStr), "Current range set to: %d", tmpI);
+              snprintf(tmpStr, sizeof(tmpStr), "Current range set to: %ld", tmpI);
             } else {
-              snprintf(tmpStr, sizeof(tmpStr), "Error: Current range could not be set to: %d", tmpI);
+              snprintf(tmpStr, sizeof(tmpStr), "Error: Current range could not be set to: %ld", tmpI);
             }
           } else {
             snprintf(tmpStr, sizeof(tmpStr), "Current range outside of range [0..3]");
@@ -1241,13 +1630,13 @@ void handleReceiverTransmitterCommand(const char* command) {
             case '1': { // LED1
               afe44xx_led1Power =  tmpI;
               afe44xx.setLEDpower(afe44xx_led1Power, 1);
-              snprintf(tmpStr, sizeof(tmpStr), "LED1 power set to: %d", tmpI);
+              snprintf(tmpStr, sizeof(tmpStr), "LED1 power set to: %ld", tmpI);
               break;
             }
             case '2': { // LED2
               afe44xx_led2Power =  tmpI;
               afe44xx.setLEDpower(afe44xx_led2Power, 2);
-              snprintf(tmpStr, sizeof(tmpStr), "LED2 power set to: %d", tmpI);
+              snprintf(tmpStr, sizeof(tmpStr), "LED2 power set to: %ld", tmpI);
               break;
             }
             default: {
@@ -1293,7 +1682,52 @@ void handleParameterCommand(const char* command) {
       return;
     }
     strlcpy(ble_name, name, sizeof(ble_name));
-    LOGln("BLE name '%s', save with Ps and reboot with x to apply", ble_name);
+    LOGln("BLE name '%s', save with Ps; Lb0 then Lb1 applies it now", ble_name);
+    return;
+  }
+
+  // BLE status of the library, printed on USB
+  if (cmd1 == 'L' && cmd2 == 'b' && command_len == 3U && command[2] == 's') {
+    if (ble_on) ble.printStats(Serial);
+    else        LOGln("BLE is stopped");
+    return;
+  }
+
+  // BLE stop / start now, the boot default is saved with Ps
+  if (cmd1 == 'L' && cmd2 == 'b') {
+    if (!numeric_valid || (value != 0 && value != 1)) { LOGln("Usage: Lb0 or Lb1, BLE off/on"); return; }
+    ble_en = (value == 1);
+    if (ble_en) {
+      bleStart();
+      LOGln(ble_on ? "BLE started as '%s', save with Ps to start it at boot" : "BLE start failed", ble_name);
+    } else {
+      LOGln("BLE stopped, save with Ps to keep it off after a reboot");   // before the stop: this may be the reply to a BLE command
+      bleStop();
+    }
+    return;
+  }
+
+  // BLE mode, BLE is restarted if it runs
+  if (cmd1 == 'L' && cmd2 == 'm') {
+    if (!numeric_valid || value < 0 || value > 3) { LOGln("Usage: Lm0 Fast, Lm1 LowPower, Lm2 LongRange, Lm3 Balanced"); return; }
+    ble_mode = static_cast<uint8_t>(value);
+    LOGln("BLE mode = %s, %s", bleModeName(ble_mode), ble_on ? "BLE restarts" : "save with Ps");   // before the restart: this may be the reply to a BLE command
+    if (ble_on) { bleStop(); bleStart(); }
+    return;
+  }
+
+  // BLE transmit power
+  if (cmd1 == 'L' && cmd2 == 't') {
+    const bool auto_pwr = (command_len == 3U && command[2] == 'a');
+    if (!auto_pwr && (!numeric_valid || value < BLE_PWR_MIN || value > BLE_PWR_MAX)) {
+      LOGln("Usage: Lt<%d..%d dBm>, Lta = default power of the BLE mode", BLE_PWR_MIN, BLE_PWR_MAX);
+      return;
+    }
+    ble_pwr = auto_pwr ? BLE_PWR_AUTO : static_cast<int8_t>(value);
+    if (auto_pwr) LOGln("BLE power = default of the mode, %s", ble_on ? "BLE restarts" : "save with Ps");
+    else          LOGln("BLE power = %d dBm, %s", ble_pwr, ble_on ? "applied now" : "save with Ps");
+    if (ble_on && auto_pwr) { bleStop(); bleStart(); }
+    else if (ble_on)        ble.setPower(ble_pwr, PWR_ALL);
     return;
   }
 
