@@ -2,7 +2,7 @@
  * Read two microphones, Output to  CSV, Change Microphone Volume up and down
  * @author Urs Utzinger
  * @copyright GPLv3 
- * USE SPAKRFUN TINRPLUS C
+ * USE SPAKRFUN THINGPLUS C
  **/
 
 #include "Arduino.h"
