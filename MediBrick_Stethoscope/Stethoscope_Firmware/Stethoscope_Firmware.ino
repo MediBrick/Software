@@ -9,16 +9,14 @@
 
   I2S uses the ESP-IDF 5 standard mode driver (driver/i2s_std.h), the legacy driver/i2s.h is not used any more.
 
-  Hardware Configuration of pre Amplifier.
-  These are the options for components for the PCB microphone amplifier.
-  R4,R8 and C5,C8
-  Gain 17.5x: 82k   || 100pF v1 saturated
-  Gain 12x:   56k   || 150pF
-  Gain 10x:   47k   || 180pF v3 **
-  Gain  2x:    8.2k || 1nF   v2 +/-6000 counts
-  Amplifier designed as ~20kHz lowpass
-
+Urs Utzinger, 2026
+Anthropic Claude assisted development
 */
+
+// Optimization level of this sketch. The ESP32 Arduino core builds with -Os (smallest code); -O2 inlines more and runs
+// faster, which the audio task needs. The line applies to all functions defined below it in this file (not to the core
+// and not to libraries). Remove it to go back to -Os.
+#pragma GCC optimize ("O2")
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -338,6 +336,11 @@ struct Settings {
 };
 
 Settings settings;
+// Version of `settings` for the audio task. The audio task has a higher priority than the main loop and can interrupt it
+// in the middle of commitSettings(), so it must not copy a half written struct. commitSettings() makes the version odd
+// while it writes (settings and the filter coefficients) and even again when done; the audio task copies only when the
+// version is even and unchanged after the copy, otherwise it keeps the previous copy for this block (it never waits).
+volatile uint32_t settings_version = 0;
 volatile bool data_reporting = false;   // continuous data output (not saved)
 
 enum class CommandSource : uint8_t { Usb, Ble };   // command received over USB serial or BLE serial
@@ -617,14 +620,19 @@ bool commitSettings(const Settings &next) {
     LOGln("Rejected: %s", err);
     return false;
   }
+  settings_version = settings_version + 1;          // odd: the audio task keeps its previous copy
+  __sync_synchronize();
   settings = next;
+  updateFilterCoefficients();                       // the coefficients belong to the settings (applySettings does it again, harmless)
+  __sync_synchronize();
+  settings_version = settings_version + 1;          // even: done
   applySettings();
   return true;
 }
 
 // ===================== AUDIO FILTERING =====================
 
-// The audio filters. They are used by the audio task (section 2 of the processing chain) on every sample of
+// The audio filters. They are used by the audio task (sections 2 and 3 of the processing chain) on every sample of
 // the left and the right channel. Each stage can be switched on and off (FH/Fh, FL/Fl) and the cutoff
 // frequencies are set with the Fh and Fl commands.
 //
@@ -649,8 +657,8 @@ bool commitSettings(const Settings &next) {
 //           high frequency noise above what is needed (heart sounds are mostly below 400 Hz).
 //
 // The coefficients a and b only depend on fc and fs, so they are calculated once when the cutoff changes
-// (updateFilterCoefficients) and not for every sample. The exponential function is slow, the loop below
-// only uses multiplications and additions.
+// (updateFilterCoefficients) and not for every sample. The exponential function is slow, the loops in the audio
+// task (sections 2 and 3) only use multiplications and additions.
 
 void updateFilterCoefficients() {
   const float fs = settings.fs_khz * 1000.0f;
@@ -658,25 +666,18 @@ void updateFilterCoefficients() {
   lpAlpha = 1.0f - expf(-2.0f * PI * settings.lp_fc / fs);
 }
 
-float applyAudioFilters(float inputSample, ChannelFilterState &state, const Settings &cfg, float hpA, float lpA) {
-  float x = inputSample;
-
-  if (cfg.hp_en) {
-    float y = hpA * (state.hpYPrev + x - state.hpXPrev);
-    state.hpXPrev = x;
-    state.hpYPrev = y;
-    x = y;
-  }
-
-  x *= cfg.sw_gain;
-
-  if (cfg.lp_en) {
-    state.lp1State += lpA * (x - state.lp1State);
-    state.lp2State += lpA * (state.lp1State - state.lp2State);
-    x = state.lp2State;
-  }
-
-  return x;
+// Rounds to the nearest whole number, halves to the even number, exactly like lrintf() but without the library call.
+// Adding 1.5 * 2^23 (12582912) moves the number into the range 2^23 .. 2^24 where a float can only hold whole numbers:
+// the addition itself does the rounding, and the whole number is then the lowest part of the bit pattern of the sum
+// (the pattern of 12582912.0f is 0x4B400000, every +1 adds 1 to the pattern). Valid for values between -4194304 and
+// +4194303; the value is limited to +-4000000 first. Filtered audio is at most a few hundred thousand counts (16 bit
+// input, gain up to 16), and everything beyond 16 bit is clipped later anyway. Used in the audio task (several places).
+static inline int32_t roundToInt(float x) {
+  x = (x > 4000000.0f) ? 4000000.0f : (x < -4000000.0f) ? -4000000.0f : x;
+  const float t = x + 12582912.0f;
+  int32_t bits;
+  memcpy(&bits, &t, sizeof(bits));
+  return bits - 0x4B400000;
 }
 
 void resetAudioFilterState() {
@@ -1159,6 +1160,8 @@ void audioTask(void *) {
   float lastLHz = 0.0f, lastRHz = 0.0f;
   uint16_t lastLAmp = 0xFFFF, lastRAmp = 0xFFFF;
   uint32_t rng = 2463534242UL;                        // state of the noise generator
+  Settings cfg = settings;                            // settings used for the current block (copied at the start of each block)
+  float hpA = hpAlpha, lpA = lpAlpha;                 // filter coefficients that belong to cfg
 
   while (!audio_task_exit) {
     if (!audio_run_req) {                         // idle
@@ -1202,8 +1205,15 @@ void audioTask(void *) {
     if (lastReadUs != 0 && (t0 - lastReadUs) > audio_gap_us_max) audio_gap_us_max = t0 - lastReadUs;
     lastReadUs = t0;
 
-    const Settings cfg = settings;                // settings and coefficients as they are for this block
-    const float hpA = hpAlpha, lpA = lpAlpha;
+    // Settings and filter coefficients for this block: a copy that is complete (see settings_version). If a command is
+    // just changing them, the copy of the previous block is used for this block and the new values come with the next one.
+    const uint32_t versionBefore = settings_version;
+    if ((versionBefore & 1U) == 0U) {
+      const Settings latest = settings;
+      const float latestHp = hpAlpha, latestLp = lpAlpha;
+      __sync_synchronize();
+      if (settings_version == versionBefore) { cfg = latest; hpA = latestHp; lpA = latestLp; }
+    }
     const bool bypass = cfg.nc_mode == 0 && !cfg.hp_en && !cfg.lp_en && fabsf(cfg.sw_gain - 1.0f) < 0.0001f;   // nothing to calculate: sections 2, 3 and 5 are skipped
     const bool bothEars = (cfg.nc_mode == 1);     // N1: the result is played in both ears
     const float fsHz = cfg.fs_khz * 1000.0f;
@@ -1268,80 +1278,143 @@ void audioTask(void *) {
       }
     }
 
-    // One pass over the block: sections 2 to 5 are done one frame (one left and one right sample) at a time.
+    // The block is processed in separate loops, one per section. Which sections run is decided once per block (the
+    // if statements around the loops), so the loops themselves contain no tests of the settings and the compiler can keep
+    // the filter memory in registers while it runs through the block. chL / chR hold the samples as floats while the
+    // filters work on them, intL / intR the rounded results (static: too big for the stack of the task).
+    static float   chL[AUDIO_BLOCK_FRAMES], chR[AUDIO_BLOCK_FRAMES];
+    static int32_t intL[AUDIO_BLOCK_FRAMES], intR[AUDIO_BLOCK_FRAMES];
+    const int frames = sampleCount / 2;           // one frame = one left and one right sample
     size_t blkLen = 0;                            // characters in blk
     int32_t peakL = 0, peakR = 0;                 // input level of this block, shown by the i command to set the input gain (Gi)
     uint32_t clippedFrames = 0;                   // input frames at full scale
     uint32_t clippedOut = 0;                      // output samples that had to be limited to 16 bit
-    for (int i = 0; i + 1 < sampleCount; i += 2) {
 
-      // Input level meter: largest absolute sample and number of frames with a sample at full scale (+-32767), measured on
-      // the input before the filters. A signal at full scale is clipped by the codec and can not be repaired by software.
-      const int32_t absL = abs((int32_t)buf[i]), absR = abs((int32_t)buf[i + 1]);
+    // ==================================================================================================================
+    // INPUT LEVEL METER: largest absolute sample and number of frames with a sample at full scale (+-32767), measured on
+    // the input before the filters. A signal at full scale is clipped by the codec and can not be repaired by software.
+    // The samples are also converted to float for the filters.
+    // ==================================================================================================================
+    for (int f = 0; f < frames; f++) {
+      const int32_t l = buf[2 * f], r = buf[2 * f + 1];
+      const int32_t absL = (l < 0) ? -l : l, absR = (r < 0) ? -r : r;
       if (absL > peakL) peakL = absL;
       if (absR > peakR) peakR = absR;
       if (absL >= 32767 || absR >= 32767) clippedFrames = clippedFrames + 1;
+      chL[f] = (float)l;
+      chR[f] = (float)r;
+    }
 
-      // ================================================================================================================
-      // SECTION 2: FILTERS AND GAIN  (high-pass -> software gain -> low-pass, for the left and the right channel)
-      // SECTION 3: SUBTRACTION       (result = right - Ng * left + Nb)
-      //
-      // Section 2 is done by applyAudioFilters(), explained at "AUDIO FILTERING" above. Each channel has its own
-      // filter memory. If the high-pass, the low-pass and the subtraction are off and the gain is 1.0 (bypass), the
-      // samples are passed on unchanged and nothing is calculated.
-      //
-      // Section 3, the subtraction: the left microphone hears the background (room noise), the right microphone
-      // hears the body sound plus the same background. Subtracting the filtered left signal, multiplied by a gain
-      // that matches the two microphones (Ng), from the filtered right signal leaves mainly the body sound. Nb adds a
-      // constant offset (in counts) to the result. Whatever reaches both microphones equally, like the radio bursts of
-      // the Bluetooth, is removed as well.
-      //
-      // The results are rounded to whole numbers once: leftI is the filtered left (background) channel, rightI is the
-      // filtered right channel, or the result of the subtraction if it is on. They are used for the data line and for
-      // the DAC.
-      // ================================================================================================================
-      int32_t leftI, rightI;
-      if (bypass) {
-        leftI  = buf[i];
-        rightI = buf[i + 1];
-      } else {
-        const float leftY = applyAudioFilters((float)buf[i],     leftFilterState,  cfg, hpA, lpA);
-        float rightY      = applyAudioFilters((float)buf[i + 1], rightFilterState, cfg, hpA, lpA);
-        if (cfg.nc_mode != 0) rightY = rightY - cfg.nc_gain * leftY + cfg.nc_bias;
-        leftI  = lrintf(leftY);
-        rightI = lrintf(rightY);
+    // ==================================================================================================================
+    // SECTION 2: FILTERS AND GAIN  (high-pass -> software gain -> low-pass, for the left and the right channel)
+    // SECTION 3: SUBTRACTION       (result = right - Ng * left + Nb)
+    //
+    // The formulas and the meaning of the filters are explained at "AUDIO FILTERING" above. Each stage is a loop over the
+    // block that runs only when the stage is on, both channels together (the two channels are independent, so the
+    // processor can overlap their calculations). Each channel has its own filter memory; it is copied into local
+    // variables before the loop and back after it. If the high-pass, the low-pass and the subtraction are off and the gain
+    // is 1.0 (bypass), no stage runs and the samples are passed on unchanged.
+    //
+    // Section 3, the subtraction: the left microphone hears the background (room noise), the right microphone
+    // hears the body sound plus the same background. Subtracting the filtered left signal, multiplied by a gain
+    // that matches the two microphones (Ng), from the filtered right signal leaves mainly the body sound. Nb adds a
+    // constant offset (in counts) to the result. Whatever reaches both microphones equally, like the radio bursts of
+    // the Bluetooth, is removed as well.
+    //
+    // The results are rounded to whole numbers once: intL is the filtered left (background) channel, intR is the
+    // filtered right channel, or the result of the subtraction if it is on. They are used for the data line and for
+    // the DAC.
+    // ==================================================================================================================
+    if (bypass) {
+      for (int f = 0; f < frames; f++) {
+        intL[f] = buf[2 * f];
+        intR[f] = buf[2 * f + 1];
       }
+    } else {
+      if (cfg.hp_en) {                            // stage 1: y[n] = a * ( y[n-1] + x[n] - x[n-1] )
+        float xpL = leftFilterState.hpXPrev,  ypL = leftFilterState.hpYPrev;
+        float xpR = rightFilterState.hpXPrev, ypR = rightFilterState.hpYPrev;
+        for (int f = 0; f < frames; f++) {
+          const float xL = chL[f], xR = chR[f];
+          const float yL = hpA * (ypL + xL - xpL);
+          const float yR = hpA * (ypR + xR - xpR);
+          xpL = xL; ypL = yL;
+          xpR = xR; ypR = yR;
+          chL[f] = yL;
+          chR[f] = yR;
+        }
+        leftFilterState.hpXPrev  = xpL; leftFilterState.hpYPrev  = ypL;
+        rightFilterState.hpXPrev = xpR; rightFilterState.hpYPrev = ypR;
+      }
+      if (cfg.sw_gain != 1.0f) {                  // stage 2: software gain (a gain of exactly 1.0 changes nothing)
+        const float g = cfg.sw_gain;
+        for (int f = 0; f < frames; f++) {
+          chL[f] *= g;
+          chR[f] *= g;
+        }
+      }
+      if (cfg.lp_en) {                            // stage 3: two low-pass stages, s += b * ( x - s )
+        float a1L = leftFilterState.lp1State,  a2L = leftFilterState.lp2State;
+        float a1R = rightFilterState.lp1State, a2R = rightFilterState.lp2State;
+        for (int f = 0; f < frames; f++) {
+          a1L += lpA * (chL[f] - a1L);
+          a1R += lpA * (chR[f] - a1R);
+          a2L += lpA * (a1L - a2L);
+          a2R += lpA * (a1R - a2R);
+          chL[f] = a2L;
+          chR[f] = a2R;
+        }
+        leftFilterState.lp1State  = a1L; leftFilterState.lp2State  = a2L;
+        rightFilterState.lp1State = a1R; rightFilterState.lp2State = a2R;
+      }
+      // Rounding: the left (background) channel is rounded before the subtraction changes the right one.
+      if (cfg.nc_mode != 0) {                     // section 3: right = right - Ng * left + Nb
+        const float ng = cfg.nc_gain, nb = cfg.nc_bias;
+        for (int f = 0; f < frames; f++) {
+          intL[f] = roundToInt(chL[f]);
+          intR[f] = roundToInt(chR[f] - ng * chL[f] + nb);
+        }
+      } else {
+        for (int f = 0; f < frames; f++) {
+          intL[f] = roundToInt(chL[f]);
+          intR[f] = roundToInt(chR[f]);
+        }
+      }
+    }
 
-      // ================================================================================================================
-      // SECTION 4: DATA LINE (text output for plotting and recording, only while data reporting is on, command z)
-      //
-      // The audio has 16000 frames per second, more than a USB or Bluetooth link can carry as text. Only every
-      // audio_decim-th frame (La command) is sent: the filtered audio is simply sampled at a lower rate. The low-pass
-      // filter is the anti-alias filter; to avoid aliasing set it to about 0.4 times the output rate or lower.
-      // What is in the line depends on the subtraction mode, to save data rate on the links (BLE carries little):
-      //   N0, N2   "left,right"  the two filtered channels. With N2 the left one is the background, not subtracted, and
-      //            the right one is the result (right - Ng * left + Nb).
-      //   N1       "result"      only the result, clipped to 16 bit like the playback, that is what both ears hear.
-      // In mode 3 (both) a new pressure reading in mmHg is added as the last number of the next line, ",pressure". The
-      // line ends with a single \n (the receiving program accepts any line end). Each signal keeps its column within a
-      // mode, lines with fewer numbers are allowed. The line is put in the output buffer of each selected link; the
-      // main loop sends it, the audio never waits for the link. The lines of a block are collected in blk
-      // and queued together after the loop over the block.
-      // ================================================================================================================
-      if (report && ++decimCounter >= cfg.audio_decim) {
-        decimCounter = 0;
+    // ==================================================================================================================
+    // SECTION 4: DATA LINE (text output for plotting and recording, only while data reporting is on, command z)
+    //
+    // The audio has 16000 frames per second, more than a USB or Bluetooth link can carry as text. Only every
+    // audio_decim-th frame (La command) is sent: the filtered audio is simply sampled at a lower rate. The low-pass
+    // filter is the anti-alias filter; to avoid aliasing set it to about 0.4 times the output rate or lower.
+    // The loop does not look at every frame: it starts at the first frame that is due and then steps by audio_decim.
+    // decimCounter counts the frames since the last line and carries over from block to block.
+    // What is in the line depends on the subtraction mode, to save data rate on the links (BLE carries little):
+    //   N0, N2   "left,right"  the two filtered channels. With N2 the left one is the background, not subtracted, and
+    //            the right one is the result (right - Ng * left + Nb).
+    //   N1       "result"      only the result, clipped to 16 bit like the playback, that is what both ears hear.
+    // In mode 3 (both) a new pressure reading in mmHg is added as the last number of the next line, ",pressure". The
+    // line ends with a single \n (the receiving program accepts any line end). Each signal keeps its column within a
+    // mode, lines with fewer numbers are allowed. The line is put in the output buffer of each selected link; the
+    // main loop sends it, the audio never waits for the link. The lines of a block are collected in blk
+    // and queued together after the loops over the block.
+    // ==================================================================================================================
+    if (report) {
+      const int decim = cfg.audio_decim;
+      const int valueCount = bothEars ? 1 : 2;           // N1: only the result
+      for (int f = decim - decimCounter - 1; f < frames; f += decim) {
         // Text without snprintf (it costs about 20 us per line, this takes about 1 us): the integers are converted by hand.
         // The digits come out last first, so they are collected in tmp[] from the end of the number and then copied in
         // reading order. u / 10 and the remainder u - q * 10 use one division by a constant, which the compiler turns into a
         // multiplication. The sign is written first and the number is taken as unsigned so that -2147483648 works as well.
         // The text is the same as "%ld,%ld\n" (N0, N2) or "%ld\n" (N1).
-        const int valueCount = bothEars ? 1 : 2;           // N1: only the result
         char *p = blk + blkLen;
         for (int k = 0; k < valueCount; k++) {
           int32_t v;
-          if (bothEars)    v = (rightI > 32767) ? 32767 : (rightI < -32768) ? -32768 : rightI;   // as played
-          else if (k == 0) v = leftI;
-          else             v = rightI;
+          if (bothEars)    v = (intR[f] > 32767) ? 32767 : (intR[f] < -32768) ? -32768 : intR[f];   // as played
+          else if (k == 0) v = intL[f];
+          else             v = intR[f];
           uint32_t u = (v < 0) ? 0u - (uint32_t)v : (uint32_t)v;
           if (v < 0) *p++ = '-';
           char tmp[10];                                   // an unsigned 32 bit number has at most 10 digits
@@ -1362,26 +1435,31 @@ void audioTask(void *) {
         }
         blkLen = (size_t)(p - blk);
       }
+      decimCounter = (decimCounter + frames) % decim;     // frames since the last line, for the next block
+    }
 
-      // ================================================================================================================
-      // SECTION 5: CLIP AND PLAY BACK
-      // Filters, gain and subtraction can make a value larger than a 16 bit number can hold. Such values are
-      // limited (clipped) to -32768 .. +32767, otherwise they would wrap around and sound like a loud crack. The
-      // number of limited samples is shown by the i command.
-      // What is played: subtraction off (N0): left and right as they are; N1: the result in both ears; N2: the left
-      // (background) channel in the left ear and the result in the right ear.
-      // The samples replace the input samples in buf and are written to the codec DAC after the loop. In bypass the
-      // input samples are already in buf.
-      // ================================================================================================================
-      if (!bypass) {
-        int32_t outL = bothEars ? rightI : leftI;
-        int32_t outR = rightI;
+    // ==================================================================================================================
+    // SECTION 5: CLIP AND PLAY BACK
+    // Filters, gain and subtraction can make a value larger than a 16 bit number can hold. Such values are
+    // limited (clipped) to -32768 .. +32767, otherwise they would wrap around and sound like a loud crack. The
+    // number of limited samples is shown by the i command.
+    // What is played: subtraction off (N0): left and right as they are; N1: the result in both ears; N2: the left
+    // (background) channel in the left ear and the result in the right ear. The source of the left ear is chosen once per
+    // block (playL).
+    // The samples replace the input samples in buf and are written to the codec DAC after the loops. In bypass the
+    // input samples are already in buf.
+    // ==================================================================================================================
+    if (!bypass) {
+      const int32_t *playL = bothEars ? intR : intL;
+      for (int f = 0; f < frames; f++) {
+        int32_t outL = playL[f];
+        int32_t outR = intR[f];
         if      (outL >  32767) { outL =  32767; clippedOut = clippedOut + 1; }
         else if (outL < -32768) { outL = -32768; clippedOut = clippedOut + 1; }
         if      (outR >  32767) { outR =  32767; clippedOut = clippedOut + 1; }
         else if (outR < -32768) { outR = -32768; clippedOut = clippedOut + 1; }
-        buf[i]     = (int16_t)outL;
-        buf[i + 1] = (int16_t)outR;
+        buf[2 * f]     = (int16_t)outL;
+        buf[2 * f + 1] = (int16_t)outR;
       }
     }
     if (blkLen > 0) queueLine(blk, blkLen);       // all data lines of this block in one step
@@ -1410,8 +1488,8 @@ void audioTask(void *) {
       for (int i = 0; i + 1 < sampleCount; i += 2) {
         fadeGain += step;
         if (step > 0.0f ? fadeGain > fadeTarget : fadeGain < fadeTarget) fadeGain = fadeTarget;
-        buf[i]     = (int16_t)lrintf(buf[i]     * fadeGain);
-        buf[i + 1] = (int16_t)lrintf(buf[i + 1] * fadeGain);
+        buf[i]     = (int16_t)roundToInt(buf[i]     * fadeGain);
+        buf[i + 1] = (int16_t)roundToInt(buf[i + 1] * fadeGain);
       }
     } else if (fadeGain == 0.0f) {
       memset(buf, 0, bytesRead);
