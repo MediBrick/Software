@@ -15,6 +15,10 @@
     - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.ino)
 - Stethoscope
     -  [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.ino)
+    - MediBrick_Stethoscope_ES8388_to_CSV: Prints the two-channel audio signal to the serial port for visualization with SerialUI application.
+    - MediBrick_Stethoscope_ES8388_TestSound: Creates test tone in left and right channels for headphones.
+    - MediBrick_Stethoscope_ES8388_to_Headphone: Plays the recorded sound to the headphone.
+    - MediBrick_Stethoscope_PressureTest: Test the arm cuff pressure sensor.
 - Activity v1
     - 📋 individual test programs in [folder](/MediBrick_Activity/v1/)
 - Activity v2

@@ -69,6 +69,10 @@ void loop() {
         Serial.println("SHT45 humidity and temperature sensor found");
       } else if (address ==  0x10) {
         Serial.println("ES8388 sound codec found");
+      } else if (address ==  0x18) {
+        Serial.println("MPRLS pressure found");
+      } else if (address ==  0x3C) {
+        Serial.println("OLED display found");
       } else {
         Serial.printf("I2C device found at address 0x%02X\n", address);
       }
