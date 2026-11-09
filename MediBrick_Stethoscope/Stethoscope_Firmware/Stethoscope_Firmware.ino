@@ -117,7 +117,7 @@ static const int MY_I2S_DATA_RX =         37; // Feather 37, MISO, Thing+ 19: ES
 
 Adafruit_SSD1306 display(OLED_SCREEN_WIDTH, OLED_SCREEN_HEIGHT, &Wire, OLED_RESET, MY_I2CSPEED, MY_I2CSPEED);   // clock during and after a display transfer
 
-// ===================== PRESSURE SENSOR =====================
+// ===================== PRESSURE SENSOR DECLARATIONS =====================
 // 1000 to 6.25 ms
 #define MPRLS_INTERVAL_MS     100
 
@@ -355,19 +355,8 @@ int      codec_in_vol     = -1;                  // input volume as last written
 uint32_t codec_i2c_errors = 0;                   // failed tries since boot, shown by the i command
 enum { CODEC_MUTE, CODEC_VOLUME, CODEC_IN_VOLUME };
 
-bool codecWrite(int what, int value) {
-  for (int attempt = 0; attempt < 3; attempt++) {
-    const bool ok = (what == CODEC_MUTE)   ? audioBoard.setMute(value != 0) :
-                    (what == CODEC_VOLUME) ? audioBoard.setVolume(value)    : audioBoard.setInputVolume(value);
-    if (ok) return true;
-    codec_i2c_errors = codec_i2c_errors + 1;
-    delay(2);
-  }
-  LOGW("ES8388 write failed 3 times (item %d, value %d)", what, value);
-  return false;
-}
-
 // ===================== HELPERS =====================
+
 float clampf(float value, float minValue, float maxValue) {
   if (value < minValue) return minValue;
   if (value > maxValue) return maxValue;
@@ -401,37 +390,8 @@ int parseNumbers(const char *p, double *out, int n) {
   return (*p == '\0') ? count : -1;
 }
 
-// Vol values that correspond exactly to each of the 9 discrete gain indices.
-// Using these avoids asymmetric jumps when stepping up vs. down.
-static const int inputVolLevels[9] = {0, 13, 25, 38, 50, 63, 75, 88, 100};
-
-int inputGainIndex(int volSetting) {
-  int vol = (int)clampf((float)volSetting, 0.0f, 100.0f);
-  return (vol * 8) / 100;
-}
-
-void getInputGainInfo(int volSetting, int &idx, int &db, int &factor) {
-  static const int dbTable[9] = {0, 3, 6, 9, 12, 15, 18, 21, 24};
-  static const int factorTable[9] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
-
-  idx = inputGainIndex(volSetting);
-  db = dbTable[idx];
-  factor = factorTable[idx];
-}
-
-void getOutputGainInfo(int volSetting, int &regValue, float &db, float &factor) {
-  int vol = (int)clampf((float)volSetting, 0.0f, 100.0f);
-
-  // arduino-audio-driver default for ES8388 is volume hack 1:
-  // register value = volume/3 for analog output volume regs.
-  regValue = vol / 3;
-
-  // ES8388 DAC Control 24/25/26/27: -45 dB + 1.5 dB per step.
-  db = -45.0f + (1.5f * (float)regValue);
-  factor = powf(10.0f, db / 20.0f);
-}
-
 // ===================== SETTINGS HANDLING =====================
+
 void setDefaults(Settings &s) {
   s.mode        = APP_MODE_BOTH;
   s.autostart   = true;
@@ -625,7 +585,45 @@ bool clearSettings() {
   return true;
 }
 
+// Push the current settings to the DSP and the codec
+void applySettings() {
+  updateFilterCoefficients();
+  if (audioInitialized && settings.fs_khz != i2s_fs_khz) {
+    // New sample rate: stop the audio (muted, the I2S channels are disabled by the audio task), set the I2S clock of
+    // both channels (MCLK = 256 * fs, BCLK and WS follow), restart if it was running. The codec follows the clocks.
+    const bool wasRunning = audio_run_req;
+    audioSetRunning(false);
+    i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)settings.fs_khz * 1000);
+    if (i2s_channel_reconfig_std_clock(i2s_tx, &clk) == ESP_OK && i2s_channel_reconfig_std_clock(i2s_rx, &clk) == ESP_OK) {
+      i2s_fs_khz = settings.fs_khz;
+      audio_gap_us_max = 0;                          // the block time is different now
+      audio_proc_us_max = 0;
+    } else {
+      LOGE("I2S clock change to %u kHz failed", settings.fs_khz);
+    }
+    if (wasRunning) audioSetRunning(true);
+  }
+  if (audioInitialized) {
+    if (settings.out_vol != codec_out_vol && codecWrite(CODEC_VOLUME, settings.out_vol))    codec_out_vol = settings.out_vol;
+    if (settings.in_vol  != codec_in_vol  && codecWrite(CODEC_IN_VOLUME, settings.in_vol)) codec_in_vol  = settings.in_vol;
+    applyRouting();
+  }
+}
+
+// Checks and activates new settings, returns false (and keeps the old ones) if they are not valid
+bool commitSettings(const Settings &next) {
+  const char *err = settingsError(next);
+  if (err) {
+    LOGln("Rejected: %s", err);
+    return false;
+  }
+  settings = next;
+  applySettings();
+  return true;
+}
+
 // ===================== AUDIO FILTERING =====================
+
 // The audio filters. They are used by the audio task (section 2 of the processing chain) on every sample of
 // the left and the right channel. Each stage can be switched on and off (FH/Fh, FL/Fl) and the cutoff
 // frequencies are set with the Fh and Fl commands.
@@ -686,14 +684,34 @@ void resetAudioFilterState() {
   rightFilterState = {0.0f, 0.0f, 0.0f, 0.0f};
 }
 
-// ===================== DATA OUTPUT =====================
+// ===================== DATA OUTPUT AND BLUETOOTH =====================
+
 // Data lines are formatted once and copied into one ring buffer per link, so a slow or absent link (e.g. no BLE client)
 // can not stall the other one or the audio. The main loop moves the buffered bytes to the links without blocking.
 // Nothing is throttled: if a link can not keep up its buffer fills and complete lines are dropped (and counted).
+// text holds one or more complete lines (each ends with \n). The audio task queues all lines of a block at once: one push
+// per link instead of one per line (a push locks the buffer, 16000 times per second at La1). If the buffer has not
+// enough room only the lines that fit are queued, the rest is dropped and the dropped lines are counted.
 void queueLine(const char *text, size_t len) {
   const uint8_t links = settings.data_out;
-  if ((links & DATA_OUT_USB) && usb_out_buff.push(text, len) != len) usb_lines_dropped = usb_lines_dropped + 1;   // push is all or nothing
-  if ((links & DATA_OUT_BLE) && ble_subscribed && ble_out_buff.push(text, len) != len) ble_lines_dropped = ble_lines_dropped + 1;
+  for (int k = 0; k < 2; k++) {
+    if (k == 0 && !(links & DATA_OUT_USB))                  continue;
+    if (k == 1 && !((links & DATA_OUT_BLE) && ble_subscribed)) continue;
+    RingBuffer<char, OUT_BUFFER_SIZE> &buff = (k == 0) ? usb_out_buff : ble_out_buff;
+    const size_t room = buff.capacity() - buff.available();   // only this producer adds, the link drain can only make more room
+    size_t keep = len;
+    if (keep > room) {                                        // keep complete lines only: back up to the end of a line
+      keep = room;
+      while (keep > 0 && text[keep - 1] != '\n') keep--;
+    }
+    if (keep > 0) buff.push(text, keep);
+    if (keep < len) {                                         // the lines after the kept ones are lost
+      uint32_t lost = 0;
+      for (size_t i = keep; i < len; i++) if (text[i] == '\n') lost++;
+      if (k == 0) usb_lines_dropped = usb_lines_dropped + lost;
+      else        ble_lines_dropped = ble_lines_dropped + lost;
+    }
+  }
 }
 
 void drainUsb() {
@@ -752,7 +770,356 @@ void bleStop() {
   ble_lr.reset();
 }
 
-// ===================== AUDIO TASK =====================
+// ===================== BATTERY =====================
+
+bool initBatteryGauge() {
+  if (!maxlipo.begin()) {
+    LOGE("MAX17048 init failed");
+    return false;
+  }
+  LOGI("MAX17048 battery gauge ready");
+  return true;
+}
+
+// ===================== DISPLAYING =====================
+
+// A screen refresh takes about 40 ms of I2C time (100 kHz), the main loop waits for it (the audio does not, it is a
+// separate task). To keep the loop free the screens first build their text, compare it with what is on the display and
+// only write the display when something changed. The loop calls them at most every OLED_INTERVAL_MS.
+
+const unsigned char BATTERY_BITMAP[] PROGMEM = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000
+  0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0,  // 00111111, 11111111, 11111111, 11111111, 01111111, 11111111, 11111111, 11110000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00010000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011110
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011110
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
+  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,  // 01000000, 00000000, 00000000, 00010000, 00000000, 00000000, 00000000, 00010000
+  0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0,  // 00111111, 11111111, 11111111, 11111111, 11111111, 11111111, 11111111, 11110000
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   // 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000
+};
+
+bool initOLED() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    LOGE("OLED init failed");
+    return false;
+  }
+
+  display.setRotation(2);
+  display.clearDisplay();
+  display.display();
+  return true;
+}
+
+// Draw battery % in the top-right corner.
+void drawBatteryPercent() {
+  if (!batteryGaugeInitialized || batteryPercent < 0.0f) return;
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", (int)(batteryPercent + 0.5f));
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(OLED_SCREEN_WIDTH - w, 0);
+  display.print(buf);
+}
+
+// Display a message on the OLED screen.
+// Not used during runtime measurement updates.
+void oledMessage(const String &line1,
+                 const String &line2 = "",
+                 const String &line3 = "",
+                 bool showBattery = true) {
+  displayContent = 0;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(line1);
+  if (line2.length()) display.println(line2);
+  if (line3.length()) display.println(line3);
+  if (showBattery) drawBatteryPercent();
+  display.display();
+}
+
+void drawBatteryIndicator(int x, int y, float percent) {
+  display.drawBitmap(x, y, BATTERY_BITMAP, BAT_W, BAT_H, SSD1306_WHITE);
+  float pct = isfinite(percent) ? percent : 0.0f;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  int width = (int)roundf((pct / 100.0f) * BAT_FULL);
+  display.fillRect(x + 3, y + 3, width, BAT_THICK, SSD1306_WHITE);
+}
+
+// Two boxes, discharge fills the left one, charge the right one, scaled to +-max_percent per hour
+void drawChargingIndicator(int x, int y, int width, int height, float percent_per_hour, float max_percent) {
+  display.drawRect(x, y, width, height, SSD1306_WHITE);
+  display.drawRect(x + width + 1, y, width, height, SSD1306_WHITE);
+  const float rate = isfinite(percent_per_hour) ? percent_per_hour : 0.0f;
+  int inner = (int)roundf((width - 2) * (fabsf(rate) / max_percent));
+  if (inner > width - 2) inner = width - 2;
+  if (inner == 0 && fabsf(rate) > 0.05f) inner = 1;   // small rates stay visible
+  if (rate < 0.0f) display.fillRect(x + width - inner, y + 2, inner, height - 4, SSD1306_WHITE);
+  else             display.fillRect(x + width + 2, y + 2, inner, height - 4, SSD1306_WHITE);
+}
+
+// Battery screen: charge boxes (discharge left, charge right), rate, battery icon, percent and voltage
+void drawBatteryScreen() {
+  static int lastPct = -2, lastVolt = -2, lastRate = -9999;
+  const int pct  = (batteryPercent >= 0.0f) ? (int)(batteryPercent + 0.5f) : -1;
+  const int volt = isfinite(batteryVoltage) ? (int)(batteryVoltage * 100.0f + 0.5f) : -1;
+  const int rate = isfinite(batteryChargeRate) ? (int)roundf(batteryChargeRate * 10.0f) : -9999;
+  if (displayContent == 2 && pct == lastPct && volt == lastVolt && rate == lastRate) return;   // nothing new to show
+  lastPct = pct; lastVolt = volt; lastRate = rate;
+  displayContent = 2;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  drawBatteryIndicator(BAT_X, BAT_Y, batteryPercent);
+  drawChargingIndicator(CHRG_X, CHRG_Y, BAT_W / 2, BAT_H - 2, batteryChargeRate, 10.0f);
+  display.setCursor(BAT_X + BAT_W + 4, CHRG_Y + 3);
+  if (rate != -9999) { display.print(batteryChargeRate, 1); display.print("%/hr"); }
+  else               { display.print("rate n/a"); }
+  display.setCursor(BAT_X + BAT_W + 4, BAT_Y + 4);
+  if (pct >= 0) { display.print(pct); display.print("% "); }
+  if (volt >= 0) { display.print(batteryVoltage, 2); display.print("V"); }
+  if (pct < 0 && volt < 0) display.print("bat n/a");
+  display.display();
+}
+
+// Status screen (128 x 32, text size 1 is 21 characters wide):
+//   mode, run state and battery percent in the first row, the audio route in the second row, then either the data and
+//   Bluetooth state (rows 3 and 4) or, while the pressure is measured, the pressure in large digits (rows 3 and 4).
+struct StatusFrame { char head[24]; char line1[24]; char line2[24]; char line3[24]; char big[16]; char pct[8]; };
+
+void drawStatusScreen() {
+  static StatusFrame last = {};
+  StatusFrame f = {};
+  const char *modeText = (appMode == APP_MODE_STETHOSCOPE) ? "Audio" : (appMode == APP_MODE_PRESSURE) ? "Pressure" :
+                         (appMode == APP_MODE_BOTH) ? "Both" : (appMode == APP_MODE_OFF) ? "Off" : "No sensors";
+  const bool active = (appMode != APP_MODE_OFF && appMode != APP_MODE_UNAVAILABLE);
+  snprintf(f.head, sizeof(f.head), "%s%s", modeText, !active ? "" : measurement_running ? " RUN" : " STOP");
+  if (batteryGaugeInitialized && batteryPercent >= 0.0f) snprintf(f.pct, sizeof(f.pct), "%d%%", (int)(batteryPercent + 0.5f));
+
+  if (appMode == APP_MODE_STETHOSCOPE || appMode == APP_MODE_BOTH)
+    snprintf(f.line1, sizeof(f.line1), "%s>L%u %ukHz N%u", inputName(settings.in_src), settings.out_line, settings.fs_khz, settings.nc_mode);
+  else if (appMode == APP_MODE_PRESSURE) snprintf(f.line1, sizeof(f.line1), "Low-pass %s", settings.p_lp_en ? "on" : "off");
+  else if (appMode == APP_MODE_OFF)      snprintf(f.line1, sizeof(f.line1), "Audio, pressure off");
+  else                                   snprintf(f.line1, sizeof(f.line1), "Check sensors");
+
+  if (measurement_running && pressureInitialized && (appMode == APP_MODE_PRESSURE || appMode == APP_MODE_BOTH)) {
+    snprintf(f.big, sizeof(f.big), "%.1f mmHg", pressure_mmHg);
+  } else {
+    const bool dataUsb = data_reporting && (settings.data_out & DATA_OUT_USB), dataBle = data_reporting && ble_on && (settings.data_out & DATA_OUT_BLE);
+    snprintf(f.line2, sizeof(f.line2), "Data %s%s%s", (dataUsb || dataBle) ? "" : "off", dataUsb ? "USB " : "", dataBle ? "BLE" : "");
+    if (batteryGaugeInitialized && batteryPercent >= 0.0f && batteryPercent < BATTERY_LOW_PERCENT) snprintf(f.line3, sizeof(f.line3), "LOW BATTERY");
+    else snprintf(f.line3, sizeof(f.line3), "BLE %s", !ble_on ? "off" : ble_subscribed ? "streaming" : ble.isConnected() ? "connected" : "advertising");
+  }
+
+  if (displayContent == 1 && memcmp(&f, &last, sizeof(f)) == 0) return;      // nothing new to show
+  last = f;
+  displayContent = 1;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print(f.head);
+  if (f.pct[0]) {
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(f.pct, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor(OLED_SCREEN_WIDTH - w, 0);
+    display.print(f.pct);
+  }
+  display.setCursor(0, 8);
+  display.print(f.line1);
+  if (f.big[0]) {
+    display.setTextSize(2);
+    display.setCursor(0, 16);
+    display.print(f.big);
+  } else {
+    display.setCursor(0, 16);
+    display.print(f.line2);
+    display.setCursor(0, 24);
+    display.print(f.line3);
+  }
+  display.display();
+}
+
+// ===================== ES8388 AUDIO (codec, I2S, routing, audio task, run control) =====================
+
+bool codecWrite(int what, int value) {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    const bool ok = (what == CODEC_MUTE)   ? audioBoard.setMute(value != 0) :
+                    (what == CODEC_VOLUME) ? audioBoard.setVolume(value)    : audioBoard.setInputVolume(value);
+    if (ok) return true;
+    codec_i2c_errors = codec_i2c_errors + 1;
+    delay(2);
+  }
+  LOGW("ES8388 write failed 3 times (item %d, value %d)", what, value);
+  return false;
+}
+
+// Vol values that correspond exactly to each of the 9 discrete gain indices.
+// Using these avoids asymmetric jumps when stepping up vs. down.
+static const int inputVolLevels[9] = {0, 13, 25, 38, 50, 63, 75, 88, 100};
+
+int inputGainIndex(int volSetting) {
+  int vol = (int)clampf((float)volSetting, 0.0f, 100.0f);
+  return (vol * 8) / 100;
+}
+
+void getInputGainInfo(int volSetting, int &idx, int &db, int &factor) {
+  static const int dbTable[9] = {0, 3, 6, 9, 12, 15, 18, 21, 24};
+  static const int factorTable[9] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+
+  idx = inputGainIndex(volSetting);
+  db = dbTable[idx];
+  factor = factorTable[idx];
+}
+
+void getOutputGainInfo(int volSetting, int &regValue, float &db, float &factor) {
+  int vol = (int)clampf((float)volSetting, 0.0f, 100.0f);
+
+  // arduino-audio-driver default for ES8388 is volume hack 1:
+  // register value = volume/3 for analog output volume regs.
+  regValue = vol / 3;
+
+  // ES8388 DAC Control 24/25/26/27: -45 dB + 1.5 dB per step.
+  db = -45.0f + (1.5f * (float)regValue);
+  factor = powf(10.0f, db / 20.0f);
+}
+
+bool initES8388() {
+  if (!codecPinsConfigured) {
+    codecPins.addI2C(
+      audio_driver::PinFunction::CODEC,
+      MY_I2C_SCL,
+      MY_I2C_SDA,
+      MY_ES8388ADDR,
+      MY_I2CSPEED,
+      Wire,
+      false
+    );
+
+    codecPins.addI2S(
+      audio_driver::PinFunction::CODEC, // Codec
+      MY_I2S_MCLK,                      // Master Clock
+      MY_I2S_BCLK,                      // Bit Clock
+      MY_I2S_LRCLK,                     // Left/Right Clock
+      MY_I2S_DATA_TX,                   // Data out of the ESP32 (to codec DSDIN)
+      MY_I2S_DATA_RX                    // Data in of the ESP32 (from codec ASDOUT)
+    );
+    codecPinsConfigured = true;
+  }
+
+  audio_driver::CodecConfig cfg;
+  cfg.output_device = DAC_OUTPUT_LINE2;   // the lines are set by applyRouting() after init
+  cfg.input_device  = ADC_INPUT_LINE1;
+  cfg.i2s.bits      = AUDIO_BIT_DEPTH;
+  cfg.i2s.rate      = (settings.fs_khz == 8) ? RATE_8K : (settings.fs_khz == 32) ? RATE_32K : (settings.fs_khz == 48) ? RATE_48K : RATE_16K;   // enum of the codec driver, not Hz; the ES8388 setup does not depend on it
+  cfg.i2s.channels  = AUDIO_NUM_CHANNELS;
+  cfg.i2s.fmt       = I2S_NORMAL;
+  cfg.i2s.mode      = MODE_SLAVE;
+
+  if (!audioBoard.begin(cfg)) {
+    LOGE("ES8388 init failed");
+    return false;
+  }
+
+  codec_out_vol = codec_in_vol = -1;
+  if (codecWrite(CODEC_VOLUME, settings.out_vol))    codec_out_vol = settings.out_vol;
+  if (codecWrite(CODEC_IN_VOLUME, settings.in_vol)) codec_in_vol  = settings.in_vol;
+
+  LOGI("ES8388 configured");
+  return true;
+}
+
+// Creates the I2S channels: master, full duplex, Philips (I2S) format, 16 bit stereo, MCLK = 256 * fs, the ESP32 generates
+// MCLK, BCLK and WS and the codec follows (slave). The channels are created stopped; the audio task enables them.
+bool initI2SDriver() {
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
+  chan_cfg.dma_desc_num        = AUDIO_DMA_BUF_COUNT;
+  chan_cfg.dma_frame_num       = AUDIO_DMA_BUF_LEN;
+  chan_cfg.auto_clear_after_cb = true;             // send zeros when there is no data to send
+
+  esp_err_t err = i2s_new_channel(&chan_cfg, &i2s_tx, &i2s_rx);
+  if (err != ESP_OK) {
+    LOGE("i2s_new_channel failed: %d", err);
+    return false;
+  }
+
+  i2s_std_config_t std_cfg = {
+    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)settings.fs_khz * 1000),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(AUDIO_I2S_DATA_BITS, I2S_SLOT_MODE_STEREO),
+    .gpio_cfg = {
+      .mclk = (gpio_num_t)MY_I2S_MCLK,
+      .bclk = (gpio_num_t)MY_I2S_BCLK,
+      .ws   = (gpio_num_t)MY_I2S_LRCLK,
+      .dout = (gpio_num_t)MY_I2S_DATA_TX,
+      .din  = (gpio_num_t)MY_I2S_DATA_RX,
+      .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+    },
+  };
+  // Same configuration on both channels of one port: the driver makes them a full duplex pair sharing the clocks
+  err = i2s_channel_init_std_mode(i2s_tx, &std_cfg);
+  if (err == ESP_OK) err = i2s_channel_init_std_mode(i2s_rx, &std_cfg);
+  if (err != ESP_OK) {
+    LOGE("i2s_channel_init_std_mode failed: %d", err);
+    i2s_del_channel(i2s_tx);
+    i2s_del_channel(i2s_rx);
+    i2s_tx = i2s_rx = nullptr;
+    return false;
+  }
+
+  i2s_fs_khz = settings.fs_khz;
+  return true;
+}
+
+// Selects the codec input line and output line from the settings and applies the input source and the subtraction mode.
+// Only acts when something changed. The output is faded out before and faded in after the change; if the codec input
+// or output was changed it is held at zero while the input settles.
+void applyRouting() {
+  if (!audioInitialized) return;
+  const uint8_t adcSel   = (settings.in_src == IN_SRC_LINE2) ? ES8388_ADC_SEL_LINE2 : ES8388_ADC_SEL_LINE1;
+  const uint8_t dacPower = (settings.out_line == 1)         ? ES8388_DAC_PWR_LINE1 : ES8388_DAC_PWR_LINE2;
+  const bool codecChange  = (adcSel != codec_adc_sel || dacPower != codec_dac_power);
+  const bool sourceChange = (settings.in_src != applied_in_src || settings.nc_mode != applied_nc_mode);
+  if (!codecChange && !sourceChange) return;
+  const bool running = audio_running;              // the codec is unmuted while the audio runs
+  audioQuiet(true, 0);
+  if (codecChange) {
+    if (running) codecWrite(CODEC_MUTE, 1);
+    const uint8_t regs[2][2] = {{ES8388_ADCCONTROL2_REG, adcSel}, {ES8388_DACPOWER_REG, dacPower}};
+    uint8_t *const written[2] = {&codec_adc_sel, &codec_dac_power};   // what is in the codec, only updated after a successful write
+    for (int r = 0; r < 2; r++) {
+      if (*written[r] == regs[r][1]) continue;
+      int err = -1;
+      for (int attempt = 0; attempt < 3 && err != 0; attempt++) {
+        Wire.beginTransmission(MY_ES8388ADDR);
+        Wire.write(regs[r][0]);
+        Wire.write(regs[r][1]);
+        err = Wire.endTransmission();
+        if (err != 0) { codec_i2c_errors = codec_i2c_errors + 1; delay(2); }
+      }
+      if (err == 0) *written[r] = regs[r][1];
+      else          LOGE("ES8388 register 0x%02X write failed (endTransmission %d), tried again at the next change", regs[r][0], err);
+    }
+    if (running) codecWrite(CODEC_MUTE, 0);
+  }
+  applied_in_src  = settings.in_src;
+  applied_nc_mode = settings.nc_mode;
+  audioQuiet(false, codecChange ? AUDIO_SETTLE_MS : 0);
+}
+
 // Runs on its own core 1 task so that commands, display, battery and pressure can not stall the audio.
 // The task owns the I2S driver while it runs. The main loop only sets audio_run_req / audio_task_exit and
 // waits for audio_running, and it is the only one that talks to the codec and the OLED over I2C.
@@ -770,7 +1137,7 @@ void bleStop() {
 //   2  FILTERS+GAIN  high-pass, software gain, low-pass, separately for left and right channel
 //   3  SUBTRACTION   optional (N1, N2): removes what the left microphone (background noise) hears from the right
 //                    (stethoscope) microphone: result = right - Ng * left + Nb
-//   4  DATA LINE     every audio_decim-th frame is sent as text "left,right" to USB and/or BLE (z command)
+//   4  DATA LINE     every audio_decim-th frame is sent as text, "left,right" or only the result with N1, to USB and/or BLE (z command)
 //   5  CLIP + PLAY   limits the result to 16 bit and gives it to the DAC, this is what you hear
 //   6  FADE          ramps the output down and up around a start, a stop or a change, so it does not click
 //
@@ -784,7 +1151,7 @@ void audioTask(void *) {
   int32_t settleLeft = 0;                         // frames the output is still held at zero (section 6)
   uint32_t lastReadUs = 0;
   size_t carry = 0;                               // bytes of an incomplete frame left over from the previous read
-  char out[48];
+  static char blk[AUDIO_BLOCK_FRAMES * 24 + 48];   // the data lines of one block (section 4): at most 24 characters per line, one line has the pressure added
 
   // Memory of the tone generators (see section 1 below)
   float lc = 1.0f, ls = 0.0f, lx = 0.0f, ly = 0.0f;   // left tone:  c = cos(w), s = sin(w), current point (x, y) of the rotation
@@ -902,6 +1269,7 @@ void audioTask(void *) {
     }
 
     // One pass over the block: sections 2 to 5 are done one frame (one left and one right sample) at a time.
+    size_t blkLen = 0;                            // characters in blk
     int32_t peakL = 0, peakR = 0;                 // input level of this block, shown by the i command to set the input gain (Gi)
     uint32_t clippedFrames = 0;                   // input frames at full scale
     uint32_t clippedOut = 0;                      // output samples that had to be limited to 16 bit
@@ -950,19 +1318,49 @@ void audioTask(void *) {
       // The audio has 16000 frames per second, more than a USB or Bluetooth link can carry as text. Only every
       // audio_decim-th frame (La command) is sent: the filtered audio is simply sampled at a lower rate. The low-pass
       // filter is the anti-alias filter; to avoid aliasing set it to about 0.4 times the output rate or lower.
-      // The line has the form "left,right" and in mode 3 (both) a third number, the pressure in mmHg. The line is
-      // put in the output buffer of each selected link; the main loop sends it, the audio never waits for the link.
+      // What is in the line depends on the subtraction mode, to save data rate on the links (BLE carries little):
+      //   N0, N2   "left,right"  the two filtered channels. With N2 the left one is the background, not subtracted, and
+      //            the right one is the result (right - Ng * left + Nb).
+      //   N1       "result"      only the result, clipped to 16 bit like the playback, that is what both ears hear.
+      // In mode 3 (both) a new pressure reading in mmHg is added as the last number of the next line, ",pressure". The
+      // line ends with a single \n (the receiving program accepts any line end). Each signal keeps its column within a
+      // mode, lines with fewer numbers are allowed. The line is put in the output buffer of each selected link; the
+      // main loop sends it, the audio never waits for the link. The lines of a block are collected in blk
+      // and queued together after the loop over the block.
       // ================================================================================================================
       if (report && ++decimCounter >= cfg.audio_decim) {
         decimCounter = 0;
-        int n;
-        if (appMode == APP_MODE_BOTH && newPressure) {
-          n = snprintf(out, sizeof(out), "%ld,%ld,%.1f\r\n", (long)leftI, (long)rightI, pressure_mmHg);
+        // Text without snprintf (it costs about 20 us per line, this takes about 1 us): the integers are converted by hand.
+        // The digits come out last first, so they are collected in tmp[] from the end of the number and then copied in
+        // reading order. u / 10 and the remainder u - q * 10 use one division by a constant, which the compiler turns into a
+        // multiplication. The sign is written first and the number is taken as unsigned so that -2147483648 works as well.
+        // The text is the same as "%ld,%ld\n" (N0, N2) or "%ld\n" (N1).
+        const int valueCount = bothEars ? 1 : 2;           // N1: only the result
+        char *p = blk + blkLen;
+        for (int k = 0; k < valueCount; k++) {
+          int32_t v;
+          if (bothEars)    v = (rightI > 32767) ? 32767 : (rightI < -32768) ? -32768 : rightI;   // as played
+          else if (k == 0) v = leftI;
+          else             v = rightI;
+          uint32_t u = (v < 0) ? 0u - (uint32_t)v : (uint32_t)v;
+          if (v < 0) *p++ = '-';
+          char tmp[10];                                   // an unsigned 32 bit number has at most 10 digits
+          int nd = 0;
+          do {
+            const uint32_t q = u / 10u;
+            tmp[nd++] = (char)('0' + (u - q * 10u));      // last digit
+            u = q;
+          } while (u != 0u);
+          while (nd > 0) *p++ = tmp[--nd];
+          if (k + 1 < valueCount) *p++ = ',';
+        }
+        if (appMode == APP_MODE_BOTH && newPressure) {    // the pressure arrives 10 times per second, snprintf is fine for the float
+          p += snprintf(p, sizeof(blk) - (size_t)(p - blk), ",%.1f\n", pressure_mmHg);
           newPressure = false;
         } else {
-          n = snprintf(out, sizeof(out), "%ld,%ld\r\n", (long)leftI, (long)rightI);
+          *p++ = '\n';
         }
-        queueLine(out, n);
+        blkLen = (size_t)(p - blk);
       }
 
       // ================================================================================================================
@@ -986,6 +1384,7 @@ void audioTask(void *) {
         buf[i + 1] = (int16_t)outR;
       }
     }
+    if (blkLen > 0) queueLine(blk, blkLen);       // all data lines of this block in one step
     if (peakL > audio_peak_l) audio_peak_l = peakL;
     if (peakR > audio_peak_r) audio_peak_r = peakR;
     audio_clip_in = audio_clip_in + clippedFrames;
@@ -1038,7 +1437,226 @@ void audioTask(void *) {
   vTaskDelete(nullptr);
 }
 
+// Waits until the audio task reports the requested state
+bool waitAudioRunning(bool want, uint32_t timeoutMs) {
+  const uint32_t t = millis();
+  while (audio_running != want) {
+    if (millis() - t > timeoutMs) return false;
+    delay(1);
+  }
+  return true;
+}
+
+// Fades the output out and waits until it is silent (quiet = true), or holds it silent for settleMs and then fades it in
+// (quiet = false). Used around everything that would click: start, stop, change of input or output. Does nothing if the
+// audio is not running. The output is silent for the codec changes in between.
+void audioQuiet(bool quiet, uint16_t settleMs) {
+  if (!audio_running) return;
+  if (quiet) {
+    audio_fade_target = 0.0f;
+    const uint32_t t = millis();
+    while (audio_fade_level > 0.0f && millis() - t < 200) delay(1);
+    delay(AUDIO_DMA_DEPTH_US(i2s_fs_khz * 1000.0f) / 1000 + 5);   // the faded audio has to leave the transmit buffers
+  } else {
+    audio_settle_ms = settleMs;
+    audio_resettle = true;
+    audio_fade_target = 1.0f;
+  }
+}
+
+// Starts or stops the audio data flow (the codec stays configured). Stopping: fade out, mute, stop the I2S channels.
+// Starting: the task starts silent, the codec is unmuted while the output is silent, then the output fades in after the
+// settling time.
+void audioSetRunning(bool run) {
+  if (!audioInitialized) return;
+  if (run) {
+    audio_fade_target = 0.0f;
+    audio_run_req = true;
+    if (!waitAudioRunning(true, 500)) LOGE("Audio task did not start");
+    codecWrite(CODEC_MUTE, 0);
+    audioQuiet(false, AUDIO_SETTLE_MS);
+  } else {
+    audioQuiet(true, 0);
+    codecWrite(CODEC_MUTE, 1);
+    audio_run_req = false;
+    if (!waitAudioRunning(false, 500)) LOGE("Audio task did not stop");
+  }
+}
+
+bool ensureAudioReady() {
+  if (audioInitialized) return true;
+
+  oledMessage("Stethoscope", "Config codec...");
+  if (!initES8388()) {
+    oledMessage("Codec init", "FAILED");
+    return false;
+  }
+
+  oledMessage("Stethoscope", "Config I2S...");
+  if (!initI2SDriver()) {
+    audioBoard.end();
+    oledMessage("I2S init", "FAILED");
+    return false;
+  }
+
+  // Stopped and muted until the run state says otherwise, the task owns the I2S channels from here on
+  codecWrite(CODEC_MUTE, 1);
+  audio_running   = false;
+  audio_run_req   = false;
+  audio_task_exit = false;
+  if (xTaskCreatePinnedToCore(audioTask, "audio", AUDIO_TASK_STACK, nullptr, AUDIO_TASK_PRIORITY, &audio_task_handle, AUDIO_TASK_CORE) != pdPASS) {
+    LOGE("Audio task creation failed");
+    i2s_del_channel(i2s_tx);
+    i2s_del_channel(i2s_rx);
+    i2s_tx = i2s_rx = nullptr;
+    audioBoard.end();
+    oledMessage("Audio task", "FAILED");
+    return false;
+  }
+
+  audioInitialized = true;
+  codec_adc_sel = codec_dac_power = 0xFF;
+  applied_in_src = applied_nc_mode = 0xFF;
+  applyRouting();                                  // codec is muted here
+  LOGI("Audio subsystem ready");
+  return true;
+}
+
+void shutdownAudio() {
+  if (!audioInitialized) return;
+
+  audioSetRunning(false);
+  audio_task_exit = true;                          // the task deletes itself
+  for (int i = 0; i < 100 && audio_task_handle != nullptr; i++) delay(5);
+  if (audio_task_handle != nullptr) {              // did not leave in time
+    LOGE("Audio task did not exit");
+    vTaskDelete(audio_task_handle);
+    audio_task_handle = nullptr;
+  }
+  audio_task_exit = false;
+  audio_running = false;
+  if (i2s_del_channel(i2s_tx) != ESP_OK || i2s_del_channel(i2s_rx) != ESP_OK) {
+    LOGE("i2s_del_channel failed");
+  }
+  i2s_tx = i2s_rx = nullptr;
+  audioBoard.end();
+  audioInitialized = false;
+  resetAudioFilterState();
+  LOGI("Audio subsystem stopped");
+}
+
+// ===================== PRESSURE SENSOR ROUTINES =====================
+
+bool initPressure() {
+  if (!mpr.begin()) {
+    LOGE("MPRLS init failed");
+    return false;
+  }
+  return true;
+}
+
+float measurePressureZero(int samples = 25) {
+  float sum = 0.0f;
+  int count = 0;
+
+  for (int i = 0; i < samples; i++) {
+    float p = mpr.readPressure();
+    if (!isnan(p)) {
+      sum += p;
+      count++;
+    }
+    delay(20);
+  }
+
+  if (count == 0) return 0.0f;
+  return sum / count;
+}
+
+bool ensurePressureReady() {
+  if (pressureInitialized) return true;
+
+  oledMessage("Pressure mode", "Initializing...");
+  if (!initPressure()) {
+    oledMessage("Pressure init", "FAILED");
+    return false;
+  }
+
+  oledMessage("Zeroing...", "Open cuff to air");
+  delay(500);
+  pressureZero = measurePressureZero();
+  pressureInitialized = true;
+
+  LOGI("Pressure subsystem ready");
+  return true;
+}
+
+// ===================== SLEEPING & WAKING =====================
+
+void waitForButtonRelease() {
+  while (digitalRead(MY_BUTTON) == LOW) {
+    delay(10);
+  }
+  delay(50);
+}
+
+// Deep sleep, the button wakes the board (it restarts like after a reset). The audio is faded out and shut down first
+// (no pop, the codec is powered down), BLE stopped, the display switched off.
+void enterDeepSleep(const char *reason) {
+  LOGln("%s, entering deep sleep, press the button to wake up", reason);
+  oledMessage("Sleeping...", reason, "Press to wake", false);
+  shutdownAudio();
+  bleStop();
+  Serial.flush();
+  display.clearDisplay();
+  display.display();
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+
+  waitForButtonRelease();
+
+  rtc_gpio_init(MY_BUTTON);
+  rtc_gpio_set_direction(MY_BUTTON, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pullup_en(MY_BUTTON);
+  rtc_gpio_pulldown_dis(MY_BUTTON);
+
+  esp_sleep_enable_ext0_wakeup(MY_BUTTON, 0);
+  delay(20);
+  esp_deep_sleep_start();
+}
+
+// Debounced button: a short press switches the screen (status, battery), holding it for BUTTON_LONG_PRESS_US shows
+// "Release button" and releasing it goes to deep sleep.
+void serviceButton(uint32_t nowUs) {
+  const int reading = digitalRead(MY_BUTTON);
+  if (reading != button_raw_state) { button_raw_state = reading; last_button_change_us = nowUs; }
+  if (button_raw_state != button_state && (nowUs - last_button_change_us) >= BUTTON_DEBOUNCE_US) {
+    button_state = button_raw_state;
+    if (button_state == LOW) {
+      button_pressed_us = nowUs;
+      button_long_shown = false;
+    } else if (button_ignore_release) {
+      button_ignore_release = false;
+    } else if (nowUs - button_pressed_us >= BUTTON_LONG_PRESS_US) {
+      enterDeepSleep("Button");
+    } else {
+      screenMode = (screenMode == SCREEN_STATUS) ? SCREEN_BATTERY : SCREEN_STATUS;
+      updateOLED = true;
+      lastOledMs = 0;
+    }
+  }
+  if (button_state == LOW && !button_ignore_release && !button_long_shown && (nowUs - button_pressed_us) >= BUTTON_LONG_PRESS_US) {
+    oledMessage("Release button", "to go to sleep", "", false);
+    button_long_shown = true;
+  }
+}
+
+void printWakeReason() {
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  const char *reason = (cause == ESP_SLEEP_WAKEUP_EXT0) ? "EXT0 (button)" : "power-on/reset/other";
+  LOGI("Wake reason: %s", reason);
+}
+
 // ===================== PRINTING =====================
+
 void applyLogLevel(int level) {
   logSetLevel(level);
 }
@@ -1244,528 +1862,7 @@ void helpMenu() {
   LOGln("");
 }
 
-bool initBatteryGauge() {
-  if (!maxlipo.begin()) {
-    LOGE("MAX17048 init failed");
-    return false;
-  }
-  LOGI("MAX17048 battery gauge ready");
-  return true;
-}
-
-// Draw battery % in the top-right corner.
-void drawBatteryPercent() {
-  if (!batteryGaugeInitialized || batteryPercent < 0.0f) return;
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%d%%", (int)(batteryPercent + 0.5f));
-  int16_t x1, y1;
-  uint16_t w, h;
-  display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(OLED_SCREEN_WIDTH - w, 0);
-  display.print(buf);
-}
-
-// Display a message on the OLED screen.
-// Not used during runtime measurement updates.
-void oledMessage(const String &line1,
-                 const String &line2 = "",
-                 const String &line3 = "",
-                 bool showBattery = true) {
-  displayContent = 0;
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(line1);
-  if (line2.length()) display.println(line2);
-  if (line3.length()) display.println(line3);
-  if (showBattery) drawBatteryPercent();
-  display.display();
-}
-
-// ===================== SCREENS, BUTTON, SLEEP =====================
-// A screen refresh takes about 40 ms of I2C time (100 kHz), the main loop waits for it (the audio does not, it is a
-// separate task). To keep the loop free the screens first build their text, compare it with what is on the display and
-// only write the display when something changed. The loop calls them at most every OLED_INTERVAL_MS.
-
-const unsigned char BATTERY_BITMAP[] PROGMEM = {
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000
-  0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0,  // 00111111, 11111111, 11111111, 11111111, 01111111, 11111111, 11111111, 11110000
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00010000
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011110
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1A,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011010
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011110
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,  // 01000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00011000
-  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,  // 01000000, 00000000, 00000000, 00010000, 00000000, 00000000, 00000000, 00010000
-  0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0,  // 00111111, 11111111, 11111111, 11111111, 11111111, 11111111, 11111111, 11110000
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   // 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000, 00000000
-};
-
-void drawBatteryIndicator(int x, int y, float percent) {
-  display.drawBitmap(x, y, BATTERY_BITMAP, BAT_W, BAT_H, SSD1306_WHITE);
-  float pct = isfinite(percent) ? percent : 0.0f;
-  if (pct < 0.0f) pct = 0.0f;
-  if (pct > 100.0f) pct = 100.0f;
-  int width = (int)roundf((pct / 100.0f) * BAT_FULL);
-  display.fillRect(x + 3, y + 3, width, BAT_THICK, SSD1306_WHITE);
-}
-
-// Two boxes, discharge fills the left one, charge the right one, scaled to +-max_percent per hour
-void drawChargingIndicator(int x, int y, int width, int height, float percent_per_hour, float max_percent) {
-  display.drawRect(x, y, width, height, SSD1306_WHITE);
-  display.drawRect(x + width + 1, y, width, height, SSD1306_WHITE);
-  const float rate = isfinite(percent_per_hour) ? percent_per_hour : 0.0f;
-  int inner = (int)roundf((width - 2) * (fabsf(rate) / max_percent));
-  if (inner > width - 2) inner = width - 2;
-  if (inner == 0 && fabsf(rate) > 0.05f) inner = 1;   // small rates stay visible
-  if (rate < 0.0f) display.fillRect(x + width - inner, y + 2, inner, height - 4, SSD1306_WHITE);
-  else             display.fillRect(x + width + 2, y + 2, inner, height - 4, SSD1306_WHITE);
-}
-
-// Battery screen: charge boxes (discharge left, charge right), rate, battery icon, percent and voltage
-void drawBatteryScreen() {
-  static int lastPct = -2, lastVolt = -2, lastRate = -9999;
-  const int pct  = (batteryPercent >= 0.0f) ? (int)(batteryPercent + 0.5f) : -1;
-  const int volt = isfinite(batteryVoltage) ? (int)(batteryVoltage * 100.0f + 0.5f) : -1;
-  const int rate = isfinite(batteryChargeRate) ? (int)roundf(batteryChargeRate * 10.0f) : -9999;
-  if (displayContent == 2 && pct == lastPct && volt == lastVolt && rate == lastRate) return;   // nothing new to show
-  lastPct = pct; lastVolt = volt; lastRate = rate;
-  displayContent = 2;
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  drawBatteryIndicator(BAT_X, BAT_Y, batteryPercent);
-  drawChargingIndicator(CHRG_X, CHRG_Y, BAT_W / 2, BAT_H - 2, batteryChargeRate, 10.0f);
-  display.setCursor(BAT_X + BAT_W + 4, CHRG_Y + 3);
-  if (rate != -9999) { display.print(batteryChargeRate, 1); display.print("%/hr"); }
-  else               { display.print("rate n/a"); }
-  display.setCursor(BAT_X + BAT_W + 4, BAT_Y + 4);
-  if (pct >= 0) { display.print(pct); display.print("% "); }
-  if (volt >= 0) { display.print(batteryVoltage, 2); display.print("V"); }
-  if (pct < 0 && volt < 0) display.print("bat n/a");
-  display.display();
-}
-
-// Status screen (128 x 32, text size 1 is 21 characters wide):
-//   mode, run state and battery percent in the first row, the audio route in the second row, then either the data and
-//   Bluetooth state (rows 3 and 4) or, while the pressure is measured, the pressure in large digits (rows 3 and 4).
-struct StatusFrame { char head[24]; char line1[24]; char line2[24]; char line3[24]; char big[16]; char pct[8]; };
-
-void drawStatusScreen() {
-  static StatusFrame last = {};
-  StatusFrame f = {};
-  const char *modeText = (appMode == APP_MODE_STETHOSCOPE) ? "Audio" : (appMode == APP_MODE_PRESSURE) ? "Pressure" :
-                         (appMode == APP_MODE_BOTH) ? "Both" : (appMode == APP_MODE_OFF) ? "Off" : "No sensors";
-  const bool active = (appMode != APP_MODE_OFF && appMode != APP_MODE_UNAVAILABLE);
-  snprintf(f.head, sizeof(f.head), "%s%s", modeText, !active ? "" : measurement_running ? " RUN" : " STOP");
-  if (batteryGaugeInitialized && batteryPercent >= 0.0f) snprintf(f.pct, sizeof(f.pct), "%d%%", (int)(batteryPercent + 0.5f));
-
-  if (appMode == APP_MODE_STETHOSCOPE || appMode == APP_MODE_BOTH)
-    snprintf(f.line1, sizeof(f.line1), "%s>L%u %ukHz N%u", inputName(settings.in_src), settings.out_line, settings.fs_khz, settings.nc_mode);
-  else if (appMode == APP_MODE_PRESSURE) snprintf(f.line1, sizeof(f.line1), "Low-pass %s", settings.p_lp_en ? "on" : "off");
-  else if (appMode == APP_MODE_OFF)      snprintf(f.line1, sizeof(f.line1), "Audio, pressure off");
-  else                                   snprintf(f.line1, sizeof(f.line1), "Check sensors");
-
-  if (measurement_running && pressureInitialized && (appMode == APP_MODE_PRESSURE || appMode == APP_MODE_BOTH)) {
-    snprintf(f.big, sizeof(f.big), "%.1f mmHg", pressure_mmHg);
-  } else {
-    const bool dataUsb = data_reporting && (settings.data_out & DATA_OUT_USB), dataBle = data_reporting && ble_on && (settings.data_out & DATA_OUT_BLE);
-    snprintf(f.line2, sizeof(f.line2), "Data %s%s%s", (dataUsb || dataBle) ? "" : "off", dataUsb ? "USB " : "", dataBle ? "BLE" : "");
-    if (batteryGaugeInitialized && batteryPercent >= 0.0f && batteryPercent < BATTERY_LOW_PERCENT) snprintf(f.line3, sizeof(f.line3), "LOW BATTERY");
-    else snprintf(f.line3, sizeof(f.line3), "BLE %s", !ble_on ? "off" : ble_subscribed ? "streaming" : ble.isConnected() ? "connected" : "advertising");
-  }
-
-  if (displayContent == 1 && memcmp(&f, &last, sizeof(f)) == 0) return;      // nothing new to show
-  last = f;
-  displayContent = 1;
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.print(f.head);
-  if (f.pct[0]) {
-    int16_t x1, y1;
-    uint16_t w, h;
-    display.getTextBounds(f.pct, 0, 0, &x1, &y1, &w, &h);
-    display.setCursor(OLED_SCREEN_WIDTH - w, 0);
-    display.print(f.pct);
-  }
-  display.setCursor(0, 8);
-  display.print(f.line1);
-  if (f.big[0]) {
-    display.setTextSize(2);
-    display.setCursor(0, 16);
-    display.print(f.big);
-  } else {
-    display.setCursor(0, 16);
-    display.print(f.line2);
-    display.setCursor(0, 24);
-    display.print(f.line3);
-  }
-  display.display();
-}
-
-void waitForButtonRelease() {
-  while (digitalRead(MY_BUTTON) == LOW) {
-    delay(10);
-  }
-  delay(50);
-}
-
-// Deep sleep, the button wakes the board (it restarts like after a reset). The audio is faded out and shut down first
-// (no pop, the codec is powered down), BLE stopped, the display switched off.
-void enterDeepSleep(const char *reason) {
-  LOGln("%s, entering deep sleep, press the button to wake up", reason);
-  oledMessage("Sleeping...", reason, "Press to wake", false);
-  shutdownAudio();
-  bleStop();
-  Serial.flush();
-  display.clearDisplay();
-  display.display();
-  display.ssd1306_command(SSD1306_DISPLAYOFF);
-
-  waitForButtonRelease();
-
-  rtc_gpio_init(MY_BUTTON);
-  rtc_gpio_set_direction(MY_BUTTON, RTC_GPIO_MODE_INPUT_ONLY);
-  rtc_gpio_pullup_en(MY_BUTTON);
-  rtc_gpio_pulldown_dis(MY_BUTTON);
-
-  esp_sleep_enable_ext0_wakeup(MY_BUTTON, 0);
-  delay(20);
-  esp_deep_sleep_start();
-}
-
-// Debounced button: a short press switches the screen (status, battery), holding it for BUTTON_LONG_PRESS_US shows
-// "Release button" and releasing it goes to deep sleep.
-void serviceButton(uint32_t nowUs) {
-  const int reading = digitalRead(MY_BUTTON);
-  if (reading != button_raw_state) { button_raw_state = reading; last_button_change_us = nowUs; }
-  if (button_raw_state != button_state && (nowUs - last_button_change_us) >= BUTTON_DEBOUNCE_US) {
-    button_state = button_raw_state;
-    if (button_state == LOW) {
-      button_pressed_us = nowUs;
-      button_long_shown = false;
-    } else if (button_ignore_release) {
-      button_ignore_release = false;
-    } else if (nowUs - button_pressed_us >= BUTTON_LONG_PRESS_US) {
-      enterDeepSleep("Button");
-    } else {
-      screenMode = (screenMode == SCREEN_STATUS) ? SCREEN_BATTERY : SCREEN_STATUS;
-      updateOLED = true;
-      lastOledMs = 0;
-    }
-  }
-  if (button_state == LOW && !button_ignore_release && !button_long_shown && (nowUs - button_pressed_us) >= BUTTON_LONG_PRESS_US) {
-    oledMessage("Release button", "to go to sleep", "", false);
-    button_long_shown = true;
-  }
-}
-
-void printWakeReason() {
-  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  const char *reason = (cause == ESP_SLEEP_WAKEUP_EXT0) ? "EXT0 (button)" : "power-on/reset/other";
-  LOGI("Wake reason: %s", reason);
-}
-
-bool initOLED() {
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    LOGE("OLED init failed");
-    return false;
-  }
-
-  display.setRotation(2);
-  display.clearDisplay();
-  display.display();
-  return true;
-}
-
-bool initPressure() {
-  if (!mpr.begin()) {
-    LOGE("MPRLS init failed");
-    return false;
-  }
-  return true;
-}
-
-float measurePressureZero(int samples = 25) {
-  float sum = 0.0f;
-  int count = 0;
-
-  for (int i = 0; i < samples; i++) {
-    float p = mpr.readPressure();
-    if (!isnan(p)) {
-      sum += p;
-      count++;
-    }
-    delay(20);
-  }
-
-  if (count == 0) return 0.0f;
-  return sum / count;
-}
-
-bool initES8388() {
-  if (!codecPinsConfigured) {
-    codecPins.addI2C(
-      audio_driver::PinFunction::CODEC,
-      MY_I2C_SCL,
-      MY_I2C_SDA,
-      MY_ES8388ADDR,
-      MY_I2CSPEED,
-      Wire,
-      false
-    );
-
-    codecPins.addI2S(
-      audio_driver::PinFunction::CODEC, // Codec
-      MY_I2S_MCLK,                      // Master Clock
-      MY_I2S_BCLK,                      // Bit Clock
-      MY_I2S_LRCLK,                     // Left/Right Clock
-      MY_I2S_DATA_TX,                   // Data out of the ESP32 (to codec DSDIN)
-      MY_I2S_DATA_RX                    // Data in of the ESP32 (from codec ASDOUT)
-    );
-    codecPinsConfigured = true;
-  }
-
-  audio_driver::CodecConfig cfg;
-  cfg.output_device = DAC_OUTPUT_LINE2;   // the lines are set by applyRouting() after init
-  cfg.input_device  = ADC_INPUT_LINE1;
-  cfg.i2s.bits      = AUDIO_BIT_DEPTH;
-  cfg.i2s.rate      = (settings.fs_khz == 8) ? RATE_8K : (settings.fs_khz == 32) ? RATE_32K : (settings.fs_khz == 48) ? RATE_48K : RATE_16K;   // enum of the codec driver, not Hz; the ES8388 setup does not depend on it
-  cfg.i2s.channels  = AUDIO_NUM_CHANNELS;
-  cfg.i2s.fmt       = I2S_NORMAL;
-  cfg.i2s.mode      = MODE_SLAVE;
-
-  if (!audioBoard.begin(cfg)) {
-    LOGE("ES8388 init failed");
-    return false;
-  }
-
-  codec_out_vol = codec_in_vol = -1;
-  if (codecWrite(CODEC_VOLUME, settings.out_vol))    codec_out_vol = settings.out_vol;
-  if (codecWrite(CODEC_IN_VOLUME, settings.in_vol)) codec_in_vol  = settings.in_vol;
-
-  LOGI("ES8388 configured");
-  return true;
-}
-
-// Creates the I2S channels: master, full duplex, Philips (I2S) format, 16 bit stereo, MCLK = 256 * fs, the ESP32 generates
-// MCLK, BCLK and WS and the codec follows (slave). The channels are created stopped; the audio task enables them.
-bool initI2SDriver() {
-  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
-  chan_cfg.dma_desc_num        = AUDIO_DMA_BUF_COUNT;
-  chan_cfg.dma_frame_num       = AUDIO_DMA_BUF_LEN;
-  chan_cfg.auto_clear_after_cb = true;             // send zeros when there is no data to send
-
-  esp_err_t err = i2s_new_channel(&chan_cfg, &i2s_tx, &i2s_rx);
-  if (err != ESP_OK) {
-    LOGE("i2s_new_channel failed: %d", err);
-    return false;
-  }
-
-  i2s_std_config_t std_cfg = {
-    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)settings.fs_khz * 1000),
-    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(AUDIO_I2S_DATA_BITS, I2S_SLOT_MODE_STEREO),
-    .gpio_cfg = {
-      .mclk = (gpio_num_t)MY_I2S_MCLK,
-      .bclk = (gpio_num_t)MY_I2S_BCLK,
-      .ws   = (gpio_num_t)MY_I2S_LRCLK,
-      .dout = (gpio_num_t)MY_I2S_DATA_TX,
-      .din  = (gpio_num_t)MY_I2S_DATA_RX,
-      .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
-    },
-  };
-  // Same configuration on both channels of one port: the driver makes them a full duplex pair sharing the clocks
-  err = i2s_channel_init_std_mode(i2s_tx, &std_cfg);
-  if (err == ESP_OK) err = i2s_channel_init_std_mode(i2s_rx, &std_cfg);
-  if (err != ESP_OK) {
-    LOGE("i2s_channel_init_std_mode failed: %d", err);
-    i2s_del_channel(i2s_tx);
-    i2s_del_channel(i2s_rx);
-    i2s_tx = i2s_rx = nullptr;
-    return false;
-  }
-
-  i2s_fs_khz = settings.fs_khz;
-  return true;
-}
-
-// Selects the codec input line and output line from the settings and applies the input source and the subtraction mode.
-// Only acts when something changed. The output is faded out before and faded in after the change; if the codec input
-// or output was changed it is held at zero while the input settles.
-void applyRouting() {
-  if (!audioInitialized) return;
-  const uint8_t adcSel   = (settings.in_src == IN_SRC_LINE2) ? ES8388_ADC_SEL_LINE2 : ES8388_ADC_SEL_LINE1;
-  const uint8_t dacPower = (settings.out_line == 1)         ? ES8388_DAC_PWR_LINE1 : ES8388_DAC_PWR_LINE2;
-  const bool codecChange  = (adcSel != codec_adc_sel || dacPower != codec_dac_power);
-  const bool sourceChange = (settings.in_src != applied_in_src || settings.nc_mode != applied_nc_mode);
-  if (!codecChange && !sourceChange) return;
-  const bool running = audio_running;              // the codec is unmuted while the audio runs
-  audioQuiet(true, 0);
-  if (codecChange) {
-    if (running) codecWrite(CODEC_MUTE, 1);
-    const uint8_t regs[2][2] = {{ES8388_ADCCONTROL2_REG, adcSel}, {ES8388_DACPOWER_REG, dacPower}};
-    uint8_t *const written[2] = {&codec_adc_sel, &codec_dac_power};   // what is in the codec, only updated after a successful write
-    for (int r = 0; r < 2; r++) {
-      if (*written[r] == regs[r][1]) continue;
-      int err = -1;
-      for (int attempt = 0; attempt < 3 && err != 0; attempt++) {
-        Wire.beginTransmission(MY_ES8388ADDR);
-        Wire.write(regs[r][0]);
-        Wire.write(regs[r][1]);
-        err = Wire.endTransmission();
-        if (err != 0) { codec_i2c_errors = codec_i2c_errors + 1; delay(2); }
-      }
-      if (err == 0) *written[r] = regs[r][1];
-      else          LOGE("ES8388 register 0x%02X write failed (endTransmission %d), tried again at the next change", regs[r][0], err);
-    }
-    if (running) codecWrite(CODEC_MUTE, 0);
-  }
-  applied_in_src  = settings.in_src;
-  applied_nc_mode = settings.nc_mode;
-  audioQuiet(false, codecChange ? AUDIO_SETTLE_MS : 0);
-}
-
-bool ensurePressureReady() {
-  if (pressureInitialized) return true;
-
-  oledMessage("Pressure mode", "Initializing...");
-  if (!initPressure()) {
-    oledMessage("Pressure init", "FAILED");
-    return false;
-  }
-
-  oledMessage("Zeroing...", "Open cuff to air");
-  delay(500);
-  pressureZero = measurePressureZero();
-  pressureInitialized = true;
-
-  LOGI("Pressure subsystem ready");
-  return true;
-}
-
-bool ensureAudioReady() {
-  if (audioInitialized) return true;
-
-  oledMessage("Stethoscope", "Config codec...");
-  if (!initES8388()) {
-    oledMessage("Codec init", "FAILED");
-    return false;
-  }
-
-  oledMessage("Stethoscope", "Config I2S...");
-  if (!initI2SDriver()) {
-    audioBoard.end();
-    oledMessage("I2S init", "FAILED");
-    return false;
-  }
-
-  // Stopped and muted until the run state says otherwise, the task owns the I2S channels from here on
-  codecWrite(CODEC_MUTE, 1);
-  audio_running   = false;
-  audio_run_req   = false;
-  audio_task_exit = false;
-  if (xTaskCreatePinnedToCore(audioTask, "audio", AUDIO_TASK_STACK, nullptr, AUDIO_TASK_PRIORITY, &audio_task_handle, AUDIO_TASK_CORE) != pdPASS) {
-    LOGE("Audio task creation failed");
-    i2s_del_channel(i2s_tx);
-    i2s_del_channel(i2s_rx);
-    i2s_tx = i2s_rx = nullptr;
-    audioBoard.end();
-    oledMessage("Audio task", "FAILED");
-    return false;
-  }
-
-  audioInitialized = true;
-  codec_adc_sel = codec_dac_power = 0xFF;
-  applied_in_src = applied_nc_mode = 0xFF;
-  applyRouting();                                  // codec is muted here
-  LOGI("Audio subsystem ready");
-  return true;
-}
-
-// Waits until the audio task reports the requested state
-bool waitAudioRunning(bool want, uint32_t timeoutMs) {
-  const uint32_t t = millis();
-  while (audio_running != want) {
-    if (millis() - t > timeoutMs) return false;
-    delay(1);
-  }
-  return true;
-}
-
-// Fades the output out and waits until it is silent (quiet = true), or holds it silent for settleMs and then fades it in
-// (quiet = false). Used around everything that would click: start, stop, change of input or output. Does nothing if the
-// audio is not running. The output is silent for the codec changes in between.
-void audioQuiet(bool quiet, uint16_t settleMs) {
-  if (!audio_running) return;
-  if (quiet) {
-    audio_fade_target = 0.0f;
-    const uint32_t t = millis();
-    while (audio_fade_level > 0.0f && millis() - t < 200) delay(1);
-    delay(AUDIO_DMA_DEPTH_US(i2s_fs_khz * 1000.0f) / 1000 + 5);   // the faded audio has to leave the transmit buffers
-  } else {
-    audio_settle_ms = settleMs;
-    audio_resettle = true;
-    audio_fade_target = 1.0f;
-  }
-}
-
-// Starts or stops the audio data flow (the codec stays configured). Stopping: fade out, mute, stop the I2S channels.
-// Starting: the task starts silent, the codec is unmuted while the output is silent, then the output fades in after the
-// settling time.
-void audioSetRunning(bool run) {
-  if (!audioInitialized) return;
-  if (run) {
-    audio_fade_target = 0.0f;
-    audio_run_req = true;
-    if (!waitAudioRunning(true, 500)) LOGE("Audio task did not start");
-    codecWrite(CODEC_MUTE, 0);
-    audioQuiet(false, AUDIO_SETTLE_MS);
-  } else {
-    audioQuiet(true, 0);
-    codecWrite(CODEC_MUTE, 1);
-    audio_run_req = false;
-    if (!waitAudioRunning(false, 500)) LOGE("Audio task did not stop");
-  }
-}
-
-// Audio and pressure only run while measuring and while the mode includes them
-void applyRunState() {
-  const bool audioMode = (appMode == APP_MODE_STETHOSCOPE || appMode == APP_MODE_BOTH);
-  audioSetRunning(measurement_running && audioMode);
-}
-
-void shutdownAudio() {
-  if (!audioInitialized) return;
-
-  audioSetRunning(false);
-  audio_task_exit = true;                          // the task deletes itself
-  for (int i = 0; i < 100 && audio_task_handle != nullptr; i++) delay(5);
-  if (audio_task_handle != nullptr) {              // did not leave in time
-    LOGE("Audio task did not exit");
-    vTaskDelete(audio_task_handle);
-    audio_task_handle = nullptr;
-  }
-  audio_task_exit = false;
-  audio_running = false;
-  if (i2s_del_channel(i2s_tx) != ESP_OK || i2s_del_channel(i2s_rx) != ESP_OK) {
-    LOGE("i2s_del_channel failed");
-  }
-  i2s_tx = i2s_rx = nullptr;
-  audioBoard.end();
-  audioInitialized = false;
-  resetAudioFilterState();
-  LOGI("Audio subsystem stopped");
-}
+// ===================== INITIALIZING (mode, start and stop of the subsystems, setup) =====================
 
 void setAppMode(int newMode) {
   bool pressureReady = pressureInitialized;
@@ -1822,43 +1919,10 @@ void setAppMode(int newMode) {
 
 }
 
-// ===================== COMMANDS =====================
-
-// Push the current settings to the DSP and the codec
-void applySettings() {
-  updateFilterCoefficients();
-  if (audioInitialized && settings.fs_khz != i2s_fs_khz) {
-    // New sample rate: stop the audio (muted, the I2S channels are disabled by the audio task), set the I2S clock of
-    // both channels (MCLK = 256 * fs, BCLK and WS follow), restart if it was running. The codec follows the clocks.
-    const bool wasRunning = audio_run_req;
-    audioSetRunning(false);
-    i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)settings.fs_khz * 1000);
-    if (i2s_channel_reconfig_std_clock(i2s_tx, &clk) == ESP_OK && i2s_channel_reconfig_std_clock(i2s_rx, &clk) == ESP_OK) {
-      i2s_fs_khz = settings.fs_khz;
-      audio_gap_us_max = 0;                          // the block time is different now
-      audio_proc_us_max = 0;
-    } else {
-      LOGE("I2S clock change to %u kHz failed", settings.fs_khz);
-    }
-    if (wasRunning) audioSetRunning(true);
-  }
-  if (audioInitialized) {
-    if (settings.out_vol != codec_out_vol && codecWrite(CODEC_VOLUME, settings.out_vol))    codec_out_vol = settings.out_vol;
-    if (settings.in_vol  != codec_in_vol  && codecWrite(CODEC_IN_VOLUME, settings.in_vol)) codec_in_vol  = settings.in_vol;
-    applyRouting();
-  }
-}
-
-// Checks and activates new settings, returns false (and keeps the old ones) if they are not valid
-bool commitSettings(const Settings &next) {
-  const char *err = settingsError(next);
-  if (err) {
-    LOGln("Rejected: %s", err);
-    return false;
-  }
-  settings = next;
-  applySettings();
-  return true;
+// Audio and pressure only run while measuring and while the mode includes them
+void applyRunState() {
+  const bool audioMode = (appMode == APP_MODE_STETHOSCOPE || appMode == APP_MODE_BOTH);
+  audioSetRunning(measurement_running && audioMode);
 }
 
 bool startMeasurement() {
@@ -1877,6 +1941,58 @@ void stopMeasurement() {
   newPressure = false;
   updateOLED = true;
 }
+
+// Serial.setTxBufferSize() exists for UART and hardware CDC, not for TinyUSB CDC (ESP32-S3 with USB mode TinyUSB)
+#if !(defined(CONFIG_IDF_TARGET_ESP32S3) && defined(ARDUINO_USB_MODE) && (ARDUINO_USB_MODE == 0) && ARDUINO_USB_CDC_ON_BOOT)
+  #define SERIAL_HAS_TX_BUFFER_SIZE 1
+#endif
+
+void setup() {
+#ifdef SERIAL_HAS_TX_BUFFER_SIZE
+  Serial.setTxBufferSize(4096);   // must be before begin(), more room for the data between two passes of the main loop
+#endif
+  Serial.begin(BAUDRATE);
+  delay(500);
+  logSetOutput(Serial);
+
+  // Settings -------------------
+  setDefaults(settings);
+  const bool loaded = readSettings(settings);
+  applyLogLevel(settings.log_level);
+#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT   // native USB CDC has no baud rate
+  if (settings.serial_baud != BAUDRATE) Serial.updateBaudRate(settings.serial_baud);
+#endif
+  printWakeReason();
+  if (loaded) LOGI("Loaded saved settings");
+  else        LOGI("No saved settings, using defaults");
+  updateFilterCoefficients();
+
+  pinMode(MY_BUTTON, INPUT_PULLUP);
+  button_raw_state = button_state = digitalRead(MY_BUTTON);
+  button_ignore_release = (button_state == LOW);      // still held from the wake up
+  last_button_change_us = micros();
+  Wire.begin(MY_I2C_SDA, MY_I2C_SCL);
+  Wire.setClock(MY_I2CSPEED);
+
+  if (!initOLED()) {
+    while (true) delay(100);
+  }
+
+  batteryGaugeInitialized = initBatteryGauge();
+
+  // BLE Serial: a background task moves the data between the BLE stack and the BLESerial buffers
+  // BLE can be switched off (Lb): no advertising, no radio activity next to the microphone preamplifier.
+  if (settings.ble_en) bleStart();
+  else                 LOGI("BLE is off (LB starts it)");
+
+  helpMenu();
+  LOGI("Booting in configured default mode");
+  measurement_running = settings.autostart && settings.mode != APP_MODE_OFF;
+  setAppMode(settings.mode);
+  awakeStartMs = millis();
+}
+
+// ===================== COMMANDS =====================
 
 void handleGeneralCommand(char c) {
   switch (c) {
@@ -2246,56 +2362,7 @@ void processCommand(const char *input, CommandSource source) {
   logSetOutput(Serial);
 }
 
-
-// Serial.setTxBufferSize() exists for UART and hardware CDC, not for TinyUSB CDC (ESP32-S3 with USB mode TinyUSB)
-#if !(defined(CONFIG_IDF_TARGET_ESP32S3) && defined(ARDUINO_USB_MODE) && (ARDUINO_USB_MODE == 0) && ARDUINO_USB_CDC_ON_BOOT)
-  #define SERIAL_HAS_TX_BUFFER_SIZE 1
-#endif
-
-void setup() {
-#ifdef SERIAL_HAS_TX_BUFFER_SIZE
-  Serial.setTxBufferSize(4096);   // must be before begin(), more room for the data between two passes of the main loop
-#endif
-  Serial.begin(BAUDRATE);
-  delay(500);
-  logSetOutput(Serial);
-
-  // Settings -------------------
-  setDefaults(settings);
-  const bool loaded = readSettings(settings);
-  applyLogLevel(settings.log_level);
-#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT   // native USB CDC has no baud rate
-  if (settings.serial_baud != BAUDRATE) Serial.updateBaudRate(settings.serial_baud);
-#endif
-  printWakeReason();
-  if (loaded) LOGI("Loaded saved settings");
-  else        LOGI("No saved settings, using defaults");
-  updateFilterCoefficients();
-
-  pinMode(MY_BUTTON, INPUT_PULLUP);
-  button_raw_state = button_state = digitalRead(MY_BUTTON);
-  button_ignore_release = (button_state == LOW);      // still held from the wake up
-  last_button_change_us = micros();
-  Wire.begin(MY_I2C_SDA, MY_I2C_SCL);
-  Wire.setClock(MY_I2CSPEED);
-
-  if (!initOLED()) {
-    while (true) delay(100);
-  }
-
-  batteryGaugeInitialized = initBatteryGauge();
-
-  // BLE Serial: a background task moves the data between the BLE stack and the BLESerial buffers
-  // BLE can be switched off (Lb): no advertising, no radio activity next to the microphone preamplifier.
-  if (settings.ble_en) bleStart();
-  else                 LOGI("BLE is off (LB starts it)");
-
-  helpMenu();
-  LOGI("Booting in configured default mode");
-  measurement_running = settings.autostart && settings.mode != APP_MODE_OFF;
-  setAppMode(settings.mode);
-  awakeStartMs = millis();
-}
+// ===================== MAIN LOOP =====================
 
 void loop() {
   serviceButton(micros());
@@ -2319,7 +2386,7 @@ void loop() {
   // Queue pressure data if data reporting is enabled (in both mode the audio task adds it to its lines)
   if (data_reporting && measurement_running && pressureInitialized && appMode == APP_MODE_PRESSURE && newPressure) {
     newPressure = false;
-    int n = snprintf(line, sizeof(line), "%.1f\r\n", pressure_mmHg);
+    int n = snprintf(line, sizeof(line), "%.1f\n", pressure_mmHg);
     queueLine(line, n);
   } // end plot pressure
 
@@ -2430,7 +2497,6 @@ void loop() {
     bleLastBytes = ble_bytes_sent;
     bleProgressMs = currentTime;
   }
-  if (!measurement_running || appMode == APP_MODE_OFF) delay(1);   // idle, give other tasks time
-  else                                                 yield();
+  delay(1);   // 1 ms tick: the idle task runs (yield() returned at once and kept this core at 100 %); everything above is fine with 1 kHz
 
 } // end loop()
