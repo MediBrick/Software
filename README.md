@@ -3,43 +3,43 @@
 ### 🔌 **Firmware** & 📋 **Test Software**
 
 - ESP32
-    - [📋 📂 ESP32 Hardware Test](/ESP32/Adafruit_FeatherS3_test/Adafruit_FeatherS3_test.ino)
-    - [📋 📂 I2C Scan](/ESP32/MediBrick_I2C_Scan/MediBrick_I2C_Scan.ino)
+    - [📋 ESP32 Hardware Test](/ESP32/Adafruit_FeatherS3_test/Adafruit_FeatherS3_test.ino)
+    - [📋 I2C Scan](/ESP32/MediBrick_I2C_Scan/MediBrick_I2C_Scan.ino)
     - [📋 📂 Display, Battery & Deep Sleep Test](/ESP32/MediBrick_Display_DeepSleep_Test/)
-    - [📋 📂 BlueTooth Low Energy Serial Test](/ESP32/BLESerial_comprehensive/BLESerial_comprehensive.ino)
+    - [📋 BlueTooth Low Energy Serial Test](/ESP32/BLESerial_comprehensive/BLESerial_comprehensive.ino)
 - ECG & BIOZ
-    - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.ino)
-        - [Instructions for ECG & BIOZ Firmware](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.md)
+    - [🔌 Current Firmware with BLESerial, Display & Sleep](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.ino)
+        - [📖 Instructions for ECG & BIOZ Firmware](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.md)
 - Spirometer
     - Need to write
 - Pulse Oximeter
-    - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.ino)
-        - [Instructions for Pulse Oximeter Firmware](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.md)
+    - [🔌 Current Firmware with BLESerial, Display & Sleep](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.ino)
+        - [📖 Instructions for Pulse Oximeter Firmware](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.md)
 - Stethoscope
-    -  [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.ino)
-        - [Instructions for Stethoscope Firmware](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.md)
+    -  [🔌 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.ino)
+        - [📖 Instructions for Stethoscope Firmware](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.md)
     - MediBrick_Stethoscope_ES8388_to_CSV: Prints the two-channel audio signal to the serial port for visualization with SerialUI application.
     - MediBrick_Stethoscope_ES8388_TestSound: Creates test tone in left and right channels for headphones.
     - MediBrick_Stethoscope_ES8388_to_Headphone: Plays the recorded sound to the headphone.
     - MediBrick_Stethoscope_PressureTest: Test the arm cuff pressure sensor.
-- Activity v1
+- Activity (legacy)
     - 📋 individual test programs in [folder](/MediBrick_Activity/v1/)
-- Activity v2
+- Activity
     - Need to write
 - Temperature
-    - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Temperature/Temperature_Firmware/Temperature_Firmware.ino)
-        - [Instructions for Temperature Firmware](/MediBrick_Temperature/Temperature_Firmware/README.md)
+    - [🔌 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Temperature/Temperature_Firmware/Temperature_Firmware.ino)
+        - [📖 Instructions for Temperature Firmware](/MediBrick_Temperature/Temperature_Firmware/README.md)
 - Environment
     - 📋 individual test programs
     - Need to write
 - DC PowerBrick
-    - [📂 Current Firmware](/MediBrick_Power/DRV8704_Firmware/DRV8704_Firmware.ino)
+    - [🔌 Current Firmware](/MediBrick_Power/DRV8704_Firmware/DRV8704_Firmware.ino)
 
-## 🧰 Libraries
+## 🧰 Libraries / Dependencies
 
 These libraries are imported and needed to create the Firmware for the MediBricks. You can install them with these automated scripts:
-- [Unix Install Script](/install_libraries.sh)
-- [Windows Install Script](/install_libraries.ps1)
+- [🐚 Unix Install Script](/install_libraries.sh)
+- [🪟 Windows Install Script](/install_libraries.ps1)
 
 and then execute:
 
