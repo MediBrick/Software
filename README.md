@@ -6,15 +6,18 @@
     - [📋 📂 ESP32 Hardware Test](/ESP32/Adafruit_FeatherS3_test/Adafruit_FeatherS3_test.ino)
     - [📋 📂 I2C Scan](/ESP32/MediBrick_I2C_Scan/MediBrick_I2C_Scan.ino)
     - [📋 📂 Display, Battery & Deep Sleep Test](/ESP32/MediBrick_Display_DeepSleep_Test/)
-    - [📋 📂 BlueTooth Serial Test](/ESP32/BLESerial_comprehensive/BLESerial_comprehensive.ino)
+    - [📋 📂 BlueTooth Low Energy Serial Test](/ESP32/BLESerial_comprehensive/BLESerial_comprehensive.ino)
 - ECG & BIOZ
     - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.ino)
+        - [Instructions for ECG & BIOZ Firmware N.A.](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.md)
 - Spirometer
     - Need to write
 - Pulse Oximeter
     - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.ino)
+        - [Instructions for Pulse Oximter Firmware N.A.](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.md)
 - Stethoscope
     -  [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.ino)
+        - [Instructions for Stethoscope Firmware](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.md) 
     - MediBrick_Stethoscope_ES8388_to_CSV: Prints the two-channel audio signal to the serial port for visualization with SerialUI application.
     - MediBrick_Stethoscope_ES8388_TestSound: Creates test tone in left and right channels for headphones.
     - MediBrick_Stethoscope_ES8388_to_Headphone: Plays the recorded sound to the headphone.
@@ -25,6 +28,7 @@
     - Need to write
 - Temperature
     - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Temperature/Temperature_Firmware/Temperature_Firmware.ino)
+        - [Instructions for Temperature Firmeware N.A.](/MediBrick_Temperature/Temperature_Firmware/Temperature_Firmware.md)
 - Environment
     - 📋 individual test programs
     - Need to write
@@ -33,11 +37,9 @@
 
 ## 🧰 Libraries
 
-These libraries are imported and needed to create the Firmware for the MediBricks.
-
-You can install them with these automated scripts
-- [Unix Shell](/install_libraries.sh)
-- [Windows Power Shell](/install_libraries.ps1)
+These libraries are imported and needed to create the Firmware for the MediBricks. You can install them with these automated scripts:
+- [Unix Install Script](/install_libraries.sh)
+- [Windows Install Script](/install_libraries.ps1)
 
 and then execute:
 
