@@ -48,6 +48,8 @@ REPOS=(
     https://github.com/TronixLab/SFM3300
     "https://github.com/uutzinger/Arduino_AFE44XX|UUtzinger_AFE44XX"
     https://github.com/pschatzmann/arduino-audio-tools
+    https://github.com/pschatzmann/arduino-audio-driver
+    https://github.com/adafruit/Adafruit_MPRLS
     https://github.com/sparkfun/SparkFun_MicroPressure_Arduino_Library
     https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary
     https://github.com/sparkfun/SparkFun_BMP581_Arduino_Library

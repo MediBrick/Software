@@ -9,15 +9,15 @@
     - [📋 📂 BlueTooth Low Energy Serial Test](/ESP32/BLESerial_comprehensive/BLESerial_comprehensive.ino)
 - ECG & BIOZ
     - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.ino)
-        - [Instructions for ECG & BIOZ Firmware N.A.](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.md)
+        - [Instructions for ECG & BIOZ Firmware](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.md)
 - Spirometer
     - Need to write
 - Pulse Oximeter
     - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.ino)
-        - [Instructions for Pulse Oximter Firmware N.A.](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.md)
+        - [Instructions for Pulse Oximeter Firmware](/MediBrick_SpO2/AFE44XX_Firmware/AFE44XX_Firmware.md)
 - Stethoscope
     -  [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.ino)
-        - [Instructions for Stethoscope Firmware](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.md) 
+        - [Instructions for Stethoscope Firmware](/MediBrick_Stethoscope/Stethoscope_Firmware/Stethoscope_Firmware.md)
     - MediBrick_Stethoscope_ES8388_to_CSV: Prints the two-channel audio signal to the serial port for visualization with SerialUI application.
     - MediBrick_Stethoscope_ES8388_TestSound: Creates test tone in left and right channels for headphones.
     - MediBrick_Stethoscope_ES8388_to_Headphone: Plays the recorded sound to the headphone.
@@ -28,7 +28,7 @@
     - Need to write
 - Temperature
     - [📂 Current Firmware with BLESerial, Display & Sleep](/MediBrick_Temperature/Temperature_Firmware/Temperature_Firmware.ino)
-        - [Instructions for Temperature Firmeware N.A.](/MediBrick_Temperature/Temperature_Firmware/Temperature_Firmware.md)
+        - [Instructions for Temperature Firmware](/MediBrick_Temperature/Temperature_Firmware/README.md)
 - Environment
     - 📋 individual test programs
     - Need to write
@@ -75,8 +75,10 @@ You can find the libraries original repository here:
 - Pulse Oximeter
     - [↗Git 📂 **AFE44XX**](https://github.com/uutzinger/Arduino_AFE44XX)
 - Stethoscope
-    - [↗Git 📂 AudioTools](https://github.com/pschatzmann/arduino-audio-tools)
-    - [↗Git 📂 Pressure Honeywell MPR](https://github.com/sparkfun/SparkFun_MicroPressure_Arduino_Library)
+    - [↗Git 📂 Audio Driver (ES8388)](https://github.com/pschatzmann/arduino-audio-driver)
+    - [↗Git 📂 Pressure Honeywell MPRLS](https://github.com/adafruit/Adafruit_MPRLS)
+    - [↗Git 📂 AudioTools (test sketches)](https://github.com/pschatzmann/arduino-audio-tools)
+    - [↗Git 📂 Pressure Honeywell MPR (test sketches)](https://github.com/sparkfun/SparkFun_MicroPressure_Arduino_Library)
 - Activity v1
     - [↗Git 📂 IMU ICM 20948](https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary)
     - [↗Git 📂 Barometric Pressure BMP581](https://github.com/sparkfun/SparkFun_BMP581_Arduino_Library)
