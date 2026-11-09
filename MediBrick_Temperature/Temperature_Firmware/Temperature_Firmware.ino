@@ -157,7 +157,7 @@ struct SystemInfo {
 //                  10 bits per byte, 80% usable. Raise BAUDRATE to increase this.
 //   BLE:           ESP32-S3 129 -> 30 kBytes/s. For the ESP32 no measurement exists, it has the same radio and
 //                  a slower CPU, so use slightly less: 25 kBytes/s.
-// Both defaults can be changed at runtime and saved (Lu, Lb commands).
+// Both defaults can be changed at runtime and saved (Lu, Lr commands).
 #define SYS_MAX_FRAME_BYTES 4092               // largest ADC DMA frame of the driver in bytes
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
   // Adafruit Feather ESP32-S3: only 5 ADC1 pins are free (D5, D6, A5/GPIO8, D9, D10),
@@ -840,8 +840,8 @@ void helpMenu() {
   LOGln("================================================================================");
   LOGln("| ENGINEERING: BLUETOOTH SERIAL (on by default)                                |");
   LOGln("|------------------------------------------------------------------------------|");
-  LOGln("| Lb<0|1>: BLE stop/start (Ps: boot)     | Lm<0-3>: BLE mode (BLE restarts)    |");
-  LOGln("| Ln<name>: BLE name (Ps, Lb0, Lb1)      |   0 Fast      7.5 ms link  +9 dBm   |");
+  LOGln("| Lb / LB: BLE stop / start (Ps: boot)   | Lm<0-3>: BLE mode (BLE restarts)    |");
+  LOGln("| Ln<name>: BLE name (Ps, Lb, LB)        |   0 Fast      7.5 ms link  +9 dBm   |");
   LOGln("| Lt<dBm>: BLE power, -24 to +9 dBm      |   1 LowPower  60-120 ms    -6 dBm   |");
   LOGln("|   e.g. -12 -9 -6 -3 0 3 6 9            |   2 LongRange coded PHY    +9 dBm   |");
   LOGln("| Lta: default power of the mode         |   3 Balanced  15-30 ms      0 dBm   |");
@@ -995,9 +995,8 @@ void handleParameterCommand(const char* cmd) {
         else        LOGln("BLE is stopped");
         break;
       }
-      if (cmd[1] == 'b') {   // BLE stop / start now, the boot default is saved with Ps
-        if (parseNumbers(cmd + 2, v, 1) != 1 || (v[0] != 0 && v[0] != 1)) { LOGln("Usage: Lb0 or Lb1, BLE off/on"); return; }
-        settings.ble_en = (v[0] == 1);
+      if ((cmd[1] == 'b' || cmd[1] == 'B') && cmd[2] == '\0') {   // Lb: BLE stop, LB: BLE start now; the boot default is saved with Ps
+        settings.ble_en = (cmd[1] == 'B');
         if (settings.ble_en) {
           bleStart();
           LOGln(ble_on ? "BLE started as '%s', save with Ps to start it at boot" : "BLE start failed", settings.ble_name);
@@ -1422,7 +1421,7 @@ void setup() {
 
   // BLE Serial -----------------
   if (settings.ble_en) bleStart();
-  else                 LOGI("BLE is off (Lb1 starts it)");
+  else                 LOGI("BLE is off (LB starts it)");
 
   // ADC ------------------------
   // Calibrated readings from ESP32 ADC are in units of milli Volts

@@ -57,7 +57,7 @@ The ADC runs continuously and every output sample is the average of `bin size` A
   A high output rate therefore needs a small bin size, a low output rate a large one. Averaging more samples reduces noise.
 * **Frame size.** `channels x bin size` must fit in one DMA frame. This limits the bin size to 1023 / channels on the ESP32-S3 and 2046 / channels on the ESP32.
 * **Data link.** The output rate is also limited by how many bytes per second the link can carry. This depends on the line length, which is about 8 characters per thermistor plus 2.
-  Conservative defaults are used for the sustainable rate of each link and can be changed (`Lu`, `Lb`):
+  Conservative defaults are used for the sustainable rate of each link and can be changed (`Lu`, `Lr`):
 
   | Link | ESP32-S3 | ESP32 |
   |---|---|---|
@@ -217,7 +217,12 @@ The stored settings are loaded when the board starts. Without `Ps` all changes a
 | `zs` / `zb` / `za` | switch off the data output to USB / BLE / both |
 | `zS` / `zB` / `zA` | switch on the data output to USB / BLE / both (and turn the data display on) |
 | `Lu<bytes/s>` | sustainable USB data rate, limits the output rate if USB output is on |
-| `Lb<bytes/s>` | sustainable BLE data rate, limits the output rate if BLE output is on |
+| `Lr<bytes/s>` | sustainable BLE data rate, limits the output rate if BLE output is on |
+| `Lb` / `LB` | stop / start BLE now (`Ps` saves it as the boot setting; BLE is on by default) |
+| `Ln<name>` | BLE name; `Ps`, then `Lb` and `LB` to apply it |
+| `Lm<0-3>` | BLE mode: 0 Fast (default), 1 LowPower, 2 LongRange, 3 Balanced; BLE restarts |
+| `Lt<dBm>` / `Lta` | BLE transmit power -24 to +9 dBm / default power of the mode |
+| `Lbs` | status of the BLE library (printed on USB) |
 | `l<0-5>` | log level: 0 debug, 1 info, 2 warning, 3 error, 4 critical, 5 none (debug messages also need `DEBUG` defined when compiling) |
 | `Ps` | save settings to non volatile memory |
 | `Pl` | load saved settings |

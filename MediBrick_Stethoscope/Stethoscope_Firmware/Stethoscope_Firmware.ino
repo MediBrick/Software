@@ -461,7 +461,7 @@ void setDefaults(Settings &s) {
   s.noise_amp   = SIM_NOISE_AMP_DEFAULT;
   s.log_level   = LOG_LEVEL_INFO;
   strlcpy(s.ble_name, BLE_NAME, sizeof(s.ble_name));
-  s.ble_en      = false;                   // BLE off: its radio bursts are audible in the microphone signal, start it with Lb1
+  s.ble_en      = false;                   // BLE off: its radio bursts are audible in the microphone signal, start it with LB
   s.ble_mode    = BLE_MODE_DEFAULT;
   s.ble_pwr     = BLE_PWR_AUTO;
   s.serial_baud = BAUDRATE;
@@ -1069,7 +1069,7 @@ void printSettings(const Settings &s) {
   LOGln("  Low-pass filter  : %s @ %.1f Hz (FL/Fl)", s.lp_en ? "ON " : "OFF", s.lp_fc);
   LOGln("  Subtraction R-L  : %s, left gain %.2f, bias %.0f (N, Ng, Nb)",
         s.nc_mode == 0 ? "OFF" : s.nc_mode == 1 ? "ON, result in both ears" : "ON, left original and right result", s.nc_gain, s.nc_bias);
-  LOGln("  Pressure         : low-pass %s @ %.1f Hz (Qe, Qf), calibration factor %.4f (Qc), output every %u-th reading (Lp)",
+  LOGln("  Pressure         : low-pass %s @ %.1f Hz (QF, Qf), calibration factor %.4f (Qc), output every %u-th reading (Lp)",
         s.p_lp_en ? "ON " : "OFF", s.p_lp_fc, s.p_cal, s.p_decim);
   LOGln("  Sample rate      : %u kHz (R)", s.fs_khz);
   LOGln("  Audio decimation : %u -> %.0f Hz output (La)", s.audio_decim, s.fs_khz * 1000.0f / s.audio_decim);
@@ -1212,8 +1212,8 @@ void helpMenu() {
   LOGln("|========================================|=====================================|");
   LOGln("| ENGINEERING: PRESSURE                  | mmHg = (reading - zero) / Qc        |");
   LOGln("|----------------------------------------|-------------------------------------|");
-  LOGln("| Qe<0|1>: low-pass off/on               | low-pass: first order, readings     |");
-  LOGln("| Qf<Hz>: low-pass cutoff, 0.1 to 4 Hz   | come 10 times per second            |");
+  LOGln("| QF[Hz]: low-pass ON (+ set Hz)         | low-pass: first order, readings     |");
+  LOGln("| Qf: OFF, Qf<Hz>: set Hz only (0.1-4)   | come 10 times per second            |");
   LOGln("| Qc<x>: calibration factor, 0.5 to 2    | zero is taken when the pressure     |");
   LOGln("| Qz: zero now, cuff open to air         | mode starts and by Qz               |");
   LOGln("|========================================|=====================================|");
@@ -1224,15 +1224,15 @@ void helpMenu() {
   LOGln("================================================================================");
   LOGln("| ENGINEERING: BLUETOOTH SERIAL (off by default)                               |");
   LOGln("|------------------------------------------------------------------------------|");
-  LOGln("| Lb<0|1>: BLE stop/start (Ps: boot)     | Lm<0-3>: BLE mode (BLE restarts)    |");
-  LOGln("| Ln<name>: BLE name (Ps, Lb0, Lb1)      |   0 Fast      7.5 ms link  +9 dBm   |");
+  LOGln("| Lb / LB: BLE stop / start (Ps: boot)   | Lm<0-3>: BLE mode (BLE restarts)    |");
+  LOGln("| Ln<name>: BLE name (Ps, Lb, LB)        |   0 Fast      7.5 ms link  +9 dBm   |");
   LOGln("| Lt<dBm>: BLE power, -24 to +9 dBm      |   1 LowPower  60-120 ms    -6 dBm   |");
   LOGln("|   e.g. -12 -9 -6 -3 0 3 6 9            |   2 LongRange coded PHY    +9 dBm   |");
   LOGln("| Lta: default power of the mode         |   3 Balanced  15-30 ms      0 dBm   |");
   LOGln("| Lbs: BLE library status (to USB)       | Power shown is the link power;      |");
   LOGln("| Default: off, mode 3, power auto       | advertising is lower in 1 and 3.    |");
   LOGln("| BLE bursts are heard in the mics:      | Fast and LongRange use the most.    |");
-  LOGln("| record audio with BLE off (Lb0).       | A stuck BLE sender restarts BLE.    |");
+  LOGln("| record audio with BLE off (Lb).        | A stuck BLE sender restarts BLE.    |");
   LOGln("================================================================================");
   LOGln("");
   LOGln("Examples:");
@@ -2028,9 +2028,8 @@ void handleLinkCommand(const char *cmd) {
   } else if (cmd[1] == 'b' && cmd[2] == 's' && cmd[3] == '\0') {   // Lbs: status of the BLE library (printed on USB)
     if (ble_on) ble.printStats(Serial);
     else        LOGln("BLE is stopped");
-  } else if (cmd[1] == 'b') {
-    if (parseNumbers(cmd + 2, v, 1) != 1 || (v[0] != 0 && v[0] != 1)) { LOGln("Usage: Lb0 or Lb1, BLE off/on at boot"); return; }
-    settings.ble_en = (v[0] == 1);
+  } else if ((cmd[1] == 'b' || cmd[1] == 'B') && cmd[2] == '\0') {   // Lb: BLE off, LB: BLE on
+    settings.ble_en = (cmd[1] == 'B');
     if (settings.ble_en) {
       bleStart();
       LOGln(ble_on ? "BLE started as '%s', save with Ps to start it at boot" : "BLE start failed", settings.ble_name);
@@ -2062,13 +2061,14 @@ void handleLinkCommand(const char *cmd) {
     while (*name == ' ') name++;
     if (!validBleName(name)) { LOGln("Usage: Ln<name>, 1..%d printable ASCII characters", BLE_NAME_MAX); return; }
     strlcpy(settings.ble_name, name, sizeof(settings.ble_name));
-    LOGln("BLE name '%s', save with Ps; Lb0 then Lb1 applies it now", settings.ble_name);
+    LOGln("BLE name '%s', save with Ps; Lb then LB applies it now", settings.ble_name);
   } else {
-    LOGln("Usage: La<n> audio decimation, Lb<0|1> BLE off/on, Lm<0-3> BLE mode, Lt<dBm> BLE power, Ln<name> BLE name, Ls<baud> serial baud rate");
+    LOGln("Usage: La<n> audio decimation, Lb/LB BLE off/on, Lm<0-3> BLE mode, Lt<dBm> BLE power, Ln<name> BLE name, Ls<baud> serial baud rate");
   }
 }
 
-// Q: pressure. Qe<0|1> low-pass off/on, Qf<Hz> low-pass cutoff, Qc<x> calibration factor, Qz zero now (cuff open to air)
+// Q: pressure. QF/Qf low-pass (like FL/Fl), Qc<x> calibration factor, Qz zero now (cuff open to air)
+// Upper case QF: on, lower case Qf: off. No number: switch. Number: QF<Hz> sets the cutoff and switches on, Qf<Hz> sets the cutoff only.
 void handlePressureCommand(const char *cmd) {
   Settings next = settings;
   double v[1];
@@ -2079,16 +2079,18 @@ void handlePressureCommand(const char *cmd) {
     pressureFilterValid = false;                   // the low-pass starts again with the next reading
     LOGln("Pressure zero = %.2f", pressureZero);
     return;
-  } else if (cmd[1] == 'e') {
-    if (parseNumbers(cmd + 2, v, 1) != 1 || (v[0] != 0 && v[0] != 1)) { LOGln("Usage: Qe0 or Qe1, pressure low-pass off/on"); return; }
-    next.p_lp_en = (v[0] == 1);
-  } else if (cmd[1] == 'f') {
-    if (parseNumbers(cmd + 2, v, 1) != 1) { LOGln("Usage: Qf<%.1f-%.1f Hz>", P_LP_FC_MIN, P_LP_FC_MAX); return; }
-    next.p_lp_fc = (float)v[0];
+  } else if (cmd[1] == 'F' || cmd[1] == 'f') {
+    if (cmd[2] == '\0') {
+      next.p_lp_en = (cmd[1] == 'F');
+    } else {
+      if (parseNumbers(cmd + 2, v, 1) != 1) { LOGln("Usage: QF[Hz] low-pass on, Qf low-pass off, Qf<%.1f-%.1f Hz> cutoff only", P_LP_FC_MIN, P_LP_FC_MAX); return; }
+      next.p_lp_fc = (float)v[0];
+      if (cmd[1] == 'F') next.p_lp_en = true;
+    }
   } else if (cmd[1] == 'c') {
     if (parseNumbers(cmd + 2, v, 1) != 1) { LOGln("Usage: Qc<%.1f-%.1f>, mmHg = (reading - zero) / Qc", P_CAL_MIN, P_CAL_MAX); return; }
     next.p_cal = (float)v[0];
-  } else { LOGln("Usage: Qe<0|1> low-pass, Qf<Hz> cutoff, Qc<x> calibration factor, Qz zero now"); return; }
+  } else { LOGln("Usage: QF/Qf[Hz] low-pass on/off, Qc<x> calibration factor, Qz zero now"); return; }
   if (commitSettings(next)) LOGln("Pressure low-pass %s @ %.1f Hz, calibration factor %.4f, save with Ps", settings.p_lp_en ? "ON" : "OFF", settings.p_lp_fc, settings.p_cal);
 }
 
@@ -2284,9 +2286,9 @@ void setup() {
   batteryGaugeInitialized = initBatteryGauge();
 
   // BLE Serial: a background task moves the data between the BLE stack and the BLESerial buffers
-  // BLE can be switched off (Lb0): no advertising, no radio activity next to the microphone preamplifier.
+  // BLE can be switched off (Lb): no advertising, no radio activity next to the microphone preamplifier.
   if (settings.ble_en) bleStart();
-  else                 LOGI("BLE is off (Lb1 starts it)");
+  else                 LOGI("BLE is off (LB starts it)");
 
   helpMenu();
   LOGI("Booting in configured default mode");

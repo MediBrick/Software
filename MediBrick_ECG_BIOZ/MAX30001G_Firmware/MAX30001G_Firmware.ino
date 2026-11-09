@@ -1680,8 +1680,8 @@ void helpMenu() {
   LOGln("================================================================================");
   LOGln("| ENGINEERING: BLUETOOTH SERIAL (on by default)                                |");
   LOGln("|------------------------------------------------------------------------------|");
-  LOGln("| Lb<0|1>: BLE stop/start (Ps: boot)     | Lm<0-3>: BLE mode (BLE restarts)    |");
-  LOGln("| Ln<name>: BLE name (Ps, Lb0, Lb1)      |   0 Fast      7.5 ms link  +9 dBm   |");
+  LOGln("| Lb / LB: BLE stop / start (Ps: boot)   | Lm<0-3>: BLE mode (BLE restarts)    |");
+  LOGln("| Ln<name>: BLE name (Ps, Lb, LB)        |   0 Fast      7.5 ms link  +9 dBm   |");
   LOGln("| Lt<dBm>: BLE power, -24 to +9 dBm      |   1 LowPower  60-120 ms    -6 dBm   |");
   LOGln("|   e.g. -12 -9 -6 -3 0 3 6 9            |   2 LongRange coded PHY    +9 dBm   |");
   LOGln("| Lta: default power of the mode         |   3 Balanced  15-30 ms      0 dBm   |");
@@ -2076,7 +2076,7 @@ void handleParameterCommand(const char* command) {
       return;
     }
     strlcpy(ble_name, name, sizeof(ble_name));
-    LOGln("BLE name '%s', save with Ps; Lb0 then Lb1 applies it now", ble_name);
+    LOGln("BLE name '%s', save with Ps; Lb then LB applies it now", ble_name);
     return;
   }
 
@@ -2088,9 +2088,8 @@ void handleParameterCommand(const char* command) {
   }
 
   // BLE stop / start now, the boot default is saved with Ps
-  if (cmd1 == 'L' && cmd2 == 'b') {
-    if (!numeric_valid || (value != 0 && value != 1)) { LOGln("Usage: Lb0 or Lb1, BLE off/on"); return; }
-    ble_en = (value == 1);
+  if (cmd1 == 'L' && (cmd2 == 'b' || cmd2 == 'B') && command_len == 2U) {   // Lb: BLE stop, LB: BLE start now
+    ble_en = (cmd2 == 'B');
     if (ble_en) {
       bleStart();
       LOGln(ble_on ? "BLE started as '%s', save with Ps to start it at boot" : "BLE start failed", ble_name);
@@ -3511,7 +3510,7 @@ void setup() {
 
   loadBleName();  // saved BLE name is needed before BLE starts
   if (ble_en) bleStart();
-  else        LOGI("BLE is off (Lb1 starts it)");
+  else        LOGI("BLE is off (LB starts it)");
 
   // LIPO Battery
   // -------------
