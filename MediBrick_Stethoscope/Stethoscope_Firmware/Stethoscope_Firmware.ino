@@ -67,11 +67,14 @@ volatile int appMode = APP_MODE_BOTH;   // active mode (can differ from settings
 bool measurement_running = false;       // start / stop, audio and pressure only run while true
 
 // ===================== PIN MAP =====================
-static const int MY_I2C_SDA    =         SDA;
-static const int MY_I2C_SCL    =         SCL;
-static const int MY_I2CSPEED   =      100000; // Clock rate of the I2C bus for all devices (codec, OLED, pressure sensor, battery gauge), kept low because of the filters on SDA and SCL
 
-static const int MY_ES8388ADDR =        0x10; // Address of ES8388 I2C port
+// Define I2C pins for ESP32-S3 Feather if not predefined
+#ifndef SDA
+  #define SDA 3
+#endif
+#ifndef SCL
+  #define SCL 4
+#endif
 
 static const gpio_num_t MY_BUTTON = GPIO_NUM_12; // Feather 12, Thing+ 9 active LOW
 
@@ -86,6 +89,23 @@ static const int MY_I2S_LRCLK  =           8; // Feather  8,   A5, Thing+ 35 Lef
 // J2 pad "DOUT" (5) is the codec ASDOUT output, it must be wired to the Feather MISO pin, the ESP32 receives on it.
 static const int MY_I2S_DATA_TX =         35; // Feather 35, MOSI, Thing+ 23: ESP32 data out -> pad DIN  -> ES8388 DSDIN (DAC, playback)
 static const int MY_I2S_DATA_RX =         37; // Feather 37, MISO, Thing+ 19: ESP32 data in  <- pad DOUT <- ES8388 ASDOUT (ADC, microphone)
+
+static const int MY_I2C_SDA    =         SDA;
+static const int MY_I2C_SCL    =         SCL;
+
+// ===================== I2C Settings =====================
+
+// Clock rate of the I2C bus for all devices (codec, OLED, pressure sensor, battery gauge), kept low because of the filters on SDA and SCL
+// Fast   400000
+// Normal 100000
+// Slow    50000
+static const int MY_I2CSPEED   =      100000; 
+// I2C clock stretch limit
+// Default 50ms
+// Long 200ms
+static const int MY_I2CCLOCKSTRETCH =     50;
+
+static const int MY_ES8388ADDR =        0x10; // Address of ES8388 I2C port
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -2020,56 +2040,6 @@ void stopMeasurement() {
   updateOLED = true;
 }
 
-// Serial.setTxBufferSize() exists for UART and hardware CDC, not for TinyUSB CDC (ESP32-S3 with USB mode TinyUSB)
-#if !(defined(CONFIG_IDF_TARGET_ESP32S3) && defined(ARDUINO_USB_MODE) && (ARDUINO_USB_MODE == 0) && ARDUINO_USB_CDC_ON_BOOT)
-  #define SERIAL_HAS_TX_BUFFER_SIZE 1
-#endif
-
-void setup() {
-#ifdef SERIAL_HAS_TX_BUFFER_SIZE
-  Serial.setTxBufferSize(4096);   // must be before begin(), more room for the data between two passes of the main loop
-#endif
-  Serial.begin(BAUDRATE);
-  delay(500);
-  logSetOutput(Serial);
-
-  // Settings -------------------
-  setDefaults(settings);
-  const bool loaded = readSettings(settings);
-  applyLogLevel(settings.log_level);
-#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT   // native USB CDC has no baud rate
-  if (settings.serial_baud != BAUDRATE) Serial.updateBaudRate(settings.serial_baud);
-#endif
-  printWakeReason();
-  if (loaded) LOGI("Loaded saved settings");
-  else        LOGI("No saved settings, using defaults");
-  updateFilterCoefficients();
-
-  pinMode(MY_BUTTON, INPUT_PULLUP);
-  button_raw_state = button_state = digitalRead(MY_BUTTON);
-  button_ignore_release = (button_state == LOW);      // still held from the wake up
-  last_button_change_us = micros();
-  Wire.begin(MY_I2C_SDA, MY_I2C_SCL);
-  Wire.setClock(MY_I2CSPEED);
-
-  if (!initOLED()) {
-    while (true) delay(100);
-  }
-
-  batteryGaugeInitialized = initBatteryGauge();
-
-  // BLE Serial: a background task moves the data between the BLE stack and the BLESerial buffers
-  // BLE can be switched off (Lb): no advertising, no radio activity next to the microphone preamplifier.
-  if (settings.ble_en) bleStart();
-  else                 LOGI("BLE is off (LB starts it)");
-
-  helpMenu();
-  LOGI("Booting in configured default mode");
-  measurement_running = settings.autostart && settings.mode != APP_MODE_OFF;
-  setAppMode(settings.mode);
-  awakeStartMs = millis();
-}
-
 // ===================== COMMANDS =====================
 
 void handleGeneralCommand(char c) {
@@ -2438,6 +2408,77 @@ void processCommand(const char *input, CommandSource source) {
   if (len == 1) handleGeneralCommand(cmd[0]);
   else          handleParameterCommand(cmd);
   logSetOutput(Serial);
+}
+
+// Boot helper
+// Prints message and waits until timeout or user sends a character on the serial terminal
+void serialTrigger(const char* mess, int timeout) {
+  uint32_t startTime = millis();
+  Serial.println(); Serial.println(mess);
+  while ( !Serial.available() && ( (millis() - startTime) < timeout ) ) {
+    delay(500);
+  }
+  // Clear the serial input buffer
+  while (Serial.available()) { Serial.read(); }
+}
+
+const char waitmsg[] = {"Enter to continue or wait 5 seconds."};
+
+// ===================== SETUP =====================
+
+// Serial.setTxBufferSize() exists for UART and hardware CDC, not for TinyUSB CDC (ESP32-S3 with USB mode TinyUSB)
+#if !(defined(CONFIG_IDF_TARGET_ESP32S3) && defined(ARDUINO_USB_MODE) && (ARDUINO_USB_MODE == 0) && ARDUINO_USB_CDC_ON_BOOT)
+  #define SERIAL_HAS_TX_BUFFER_SIZE 1
+#endif
+
+void setup() {
+#ifdef SERIAL_HAS_TX_BUFFER_SIZE
+  Serial.setTxBufferSize(4096);   // must be before begin(), more room for the data between two passes of the main loop
+#endif
+  Serial.begin(BAUDRATE);
+  logSetOutput(Serial);
+  Serial.setTimeout(1000);      // default is 1000
+  serialTrigger(waitmsg, 5000); // give user time to open serial terminal and the cuff
+
+  // Settings -------------------
+  setDefaults(settings);
+  const bool loaded = readSettings(settings);
+  applyLogLevel(settings.log_level);
+#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT   // native USB CDC has no baud rate
+  if (settings.serial_baud != BAUDRATE) Serial.updateBaudRate(settings.serial_baud);
+#endif
+  printWakeReason();
+  if (loaded) LOGI("Loaded saved settings");
+  else        LOGI("No saved settings, using defaults");
+  updateFilterCoefficients();
+
+  pinMode(MY_BUTTON, INPUT_PULLUP);
+  button_raw_state = button_state = digitalRead(MY_BUTTON);
+  button_ignore_release = (button_state == LOW);      // still held from the wake up
+  last_button_change_us = micros();
+
+  Wire.begin(MY_I2C_SDA, MY_I2C_SCL);              // SDA, SCL
+  Wire.setClock(MY_I2CSPEED);
+  Wire.setTimeOut(MY_I2CCLOCKSTRETCH);
+
+  if (MY_MPRLS_EOC >= 0) { pinMode(MY_MPRLS_EOC, INPUT); }
+  
+  if (!initOLED()) {
+    while (true) delay(100);
+  }
+
+  batteryGaugeInitialized = initBatteryGauge();
+
+  // BLE Serial: a background task moves the data between the BLE stack and the BLESerial buffers
+  // BLE can be switched off (Lb): no advertising, no radio activity next to the microphone preamplifier.
+  if (settings.ble_en) bleStart();
+  else                 LOGI("BLE is off (LB starts it)");
+
+  helpMenu();
+  LOGI("Booting in configured default mode");
+  measurement_running = settings.autostart && settings.mode != APP_MODE_OFF;
+  setAppMode(settings.mode);
+  awakeStartMs = millis();
 }
 
 // ===================== MAIN LOOP =====================

@@ -30,10 +30,11 @@ done
 command -v git >/dev/null 2>&1 || { echo "git is required but not installed." >&2; exit 1; }
 
 # Keep in sync with README.md (duplicates removed).
-# Entries are "url" (folder = repository name) or "url|folder".
+# Entries are "url" (folder = repository name), "url|folder" or "url|folder|tag".
+# With a tag the library is pinned to that release (NimBLE-Arduino master is 3.0 with an incompatible API).
 # Libraries developed by Urs Utzinger are installed as UUtzinger_<name>.
 REPOS=(
-    https://github.com/h2zero/NimBLE-Arduino
+    "https://github.com/h2zero/NimBLE-Arduino|NimBLE-Arduino|2.5.2"
     "https://github.com/uutzinger/Arduino_BLESerial|UUtzinger_BLESerial"
     "https://github.com/uutzinger/Arduino_RingBuffer|UUtzinger_RingBuffer"
     "https://github.com/uutzinger/SavitzkyGolayFilter|UUtzinger_SavitzkyGolayFilter"
@@ -100,16 +101,17 @@ if [ "$CHECK" -eq 0 ]; then
 fi
 
 for entry in "${REPOS[@]}"; do
-    url="${entry%%|*}"
-    if [ "$entry" = "$url" ]; then name="$(basename "$url")"; else name="${entry##*|}"; fi
+    IFS='|' read -r url name tag <<< "$entry"
+    [ -n "$name" ] || name="$(basename "$url")"
     dir="$LIBDIR/$name"
+    cl=(--depth 1); [ -n "$tag" ] && cl+=(--branch "$tag")
 
     if [ ! -e "$dir" ]; then
         if [ "$CHECK" -eq 1 ]; then
             echo "[MISSING]  $name"; n_new=$((n_new+1)); continue
         fi
         echo "[INSTALL]  $name"
-        if git clone --quiet --depth 1 "$url" "$dir"; then n_new=$((n_new+1)); else echo "           clone failed"; n_fail=$((n_fail+1)); fi
+        if git clone --quiet "${cl[@]}" "$url" "$dir"; then n_new=$((n_new+1)); else echo "           clone failed"; n_fail=$((n_fail+1)); fi
         continue
     fi
 
@@ -118,10 +120,25 @@ for entry in "${REPOS[@]}"; do
             echo "[REPLACE]  $name (not a git checkout, old copy moved to $name.bak)"
             rm -rf "$dir.bak"
             mv "$dir" "$dir.bak" || { n_fail=$((n_fail+1)); continue; }
-            if git clone --quiet --depth 1 "$url" "$dir"; then n_new=$((n_new+1)); else echo "           clone failed"; n_fail=$((n_fail+1)); fi
+            if git clone --quiet "${cl[@]}" "$url" "$dir"; then n_new=$((n_new+1)); else echo "           clone failed"; n_fail=$((n_fail+1)); fi
         else
             echo "[SKIP]     $name installed but not a git checkout (use --force to replace)"
             n_skip=$((n_skip+1))
+        fi
+        continue
+    fi
+
+    # Pinned library: must be at the tag's commit, whatever branch or release it was cloned from.
+    if [ -n "$tag" ]; then
+        if [ "$(git -C "$dir" rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null)" = "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" ]; then
+            echo "[OK]       $name is at $tag"; n_ok=$((n_ok+1))
+        elif [ "$CHECK" -eq 1 ]; then
+            echo "[OUTDATED] $name is not at $tag"; n_upd=$((n_upd+1))
+        elif [ -n "$(git -C "$dir" status --porcelain)" ]; then
+            echo "[SKIP]     $name is not at $tag but has local changes"; n_skip=$((n_skip+1))
+        else
+            echo "[UPDATE]   $name -> $tag"
+            if git -C "$dir" fetch --quiet --depth 1 origin "refs/tags/$tag:refs/tags/$tag" 2>/dev/null && git -C "$dir" checkout --quiet "$tag" 2>/dev/null; then n_upd=$((n_upd+1)); else echo "           update failed"; n_fail=$((n_fail+1)); fi
         fi
         continue
     fi

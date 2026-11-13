@@ -1,11 +1,37 @@
 # Software
 
-### 🔌 **Firmware** & 📋 **Test Software**
+## 🔧 **Prerequisites**
+
+MediBrick Firmware is optimized for ESP32 micro controllers.
+
+- [♾️ Arduino IDE](https://www.arduino.cc/en/software/)
+    - In the IDE under Files -> Preferences -> Additional Board Managers URL add ",https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json" at the end of the field
+    - Ctrl-Shift-B opens Board Manager: Select `esp32 by Espressif Systems`
+    - If you use Adafruit ESP32 S3: select USB Mode: `Hardware CDC and JTAG`, Upload Mode: `UART / Hardware CDC`, Partition Scheme: `Default 3MB APP` and USB CDC on Boot: `Enabled`.
+- [💻 SerialUI](https://github.com/uutzinger/SerialUI/releases/latest) is the terminal program connecting to the microcontroller both over USB and Bluetooth Low Energy Serial. You need to close the Arduino IDE Serial Monitor or Plotter tab in order to open it with SerialUI.
+
+- 🧰 Arduino Libraries are imported and needed to create the Firmware for the MediBricks. You can install them with these automated scripts:
+    - [🐚 Unix Install Script](/install_libraries.sh)
+    - [🪟 Windows Install Script](/install_libraries.ps1)
+
+    and then execute:
+
+    ```sh
+    ./install_libraries.sh           # install missing, update outdated
+    ```
+    or on Windows
+    ```powershell
+    powershell -ExecutionPolicy Bypass -File install_libraries.ps1
+    ```
+
+    Linux / macOS (installs into `~/Arduino/libraries`), Windows (installs into `%USERPROFILE%\Arduino\libraries`)
+
+## 🔌 **Firmware** & 📋 **Test Software**
 
 - ESP32
     - [📋 ESP32 Hardware Test](/ESP32/Adafruit_FeatherS3_test/Adafruit_FeatherS3_test.ino)
     - [📋 I2C Scan](/ESP32/MediBrick_I2C_Scan/MediBrick_I2C_Scan.ino)
-    - [📋 📂 Display, Battery & Deep Sleep Test](/ESP32/MediBrick_Display_DeepSleep_Test/)
+    - [📋 Display, Battery & Deep Sleep Test](/ESP32/MediBrick_Display_DeepSleep_Test/MediBrick_Display_DeepSleep_Test.ino)
     - [📋 BlueTooth Low Energy Serial Test](/ESP32/BLESerial_comprehensive/BLESerial_comprehensive.ino)
 - ECG & BIOZ
     - [🔌 Current Firmware with BLESerial, Display & Sleep](/MediBrick_ECG_BIOZ/MAX30001G_Firmware/MAX30001G_Firmware.ino)
@@ -35,23 +61,7 @@
 - DC PowerBrick
     - [🔌 Current Firmware](/MediBrick_Power/DRV8704_Firmware/DRV8704_Firmware.ino)
 
-## 🧰 Libraries / Dependencies
-
-These libraries are imported and needed to create the Firmware for the MediBricks. You can install them with these automated scripts:
-- [🐚 Unix Install Script](/install_libraries.sh)
-- [🪟 Windows Install Script](/install_libraries.ps1)
-
-and then execute:
-
-```sh
-./install_libraries.sh           # install missing, update outdated
-```
-or on Windows
-```powershell
-powershell -ExecutionPolicy Bypass -File install_libraries.ps1
-```
-
-Linux / macOS (installs into `~/Arduino/libraries`), Windows (installs into `%USERPROFILE%\Arduino\libraries`)
+## 🧰 Libraries
 
 You can find the libraries original repository here:
 

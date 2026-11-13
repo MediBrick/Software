@@ -66,10 +66,11 @@ function Get-ArduinoLibDir {
 $LibDir = Get-ArduinoLibDir
 
 # Keep in sync with README.md (duplicates removed).
-# Entries are "url" (folder = repository name) or "url|folder".
+# Entries are "url" (folder = repository name), "url|folder" or "url|folder|tag".
+# With a tag the library is pinned to that release (NimBLE-Arduino master is 3.0 with an incompatible API).
 # Libraries developed by Urs Utzinger are installed as UUtzinger_<name>.
 $Repos = @(
-    "https://github.com/h2zero/NimBLE-Arduino",
+    "https://github.com/h2zero/NimBLE-Arduino|NimBLE-Arduino|2.5.2",
     "https://github.com/uutzinger/Arduino_BLESerial|UUtzinger_BLESerial",
     "https://github.com/uutzinger/Arduino_RingBuffer|UUtzinger_RingBuffer",
     "https://github.com/uutzinger/SavitzkyGolayFilter|UUtzinger_SavitzkyGolayFilter",
@@ -127,8 +128,9 @@ function Invoke-Git {
     if ($out) { return ($out -join "`n").Trim() } else { return "" }
 }
 
-function Install-Clone($url, $dir) {
-    Invoke-Git clone --quiet --depth 1 $url $dir | Out-Null
+function Install-Clone($url, $dir, $tag) {
+    if ($tag) { Invoke-Git clone --quiet --depth 1 --branch $tag $url $dir | Out-Null }
+    else      { Invoke-Git clone --quiet --depth 1 $url $dir | Out-Null }
     if ($script:GitOk) { $script:new++ } else { Write-Host "           clone failed"; $script:fail++ }
 }
 
@@ -148,14 +150,16 @@ if (-not $Check) {
 }
 
 foreach ($entry in $Repos) {
-    $url  = $entry.Split('|')[0]
-    $name = if ($entry.Contains('|')) { $entry.Split('|')[1] } else { $url.TrimEnd('/').Split('/')[-1] }
+    $f    = $entry.Split('|')
+    $url  = $f[0]
+    $name = if ($f.Count -gt 1) { $f[1] } else { $url.TrimEnd('/').Split('/')[-1] }
+    $tag  = if ($f.Count -gt 2) { $f[2] } else { "" }
     $dir  = Join-Path $LibDir $name
 
     if (-not (Test-Path $dir)) {
         if ($Check) { Write-Host "[MISSING]  $name"; $new++; continue }
         Write-Host "[INSTALL]  $name"
-        Install-Clone $url $dir
+        Install-Clone $url $dir $tag
         continue
     }
 
@@ -164,10 +168,28 @@ foreach ($entry in $Repos) {
             Write-Host "[REPLACE]  $name (not a git checkout, old copy moved to $name.bak)"
             if (Test-Path "$dir.bak") { Remove-Item -Recurse -Force "$dir.bak" }
             Move-Item $dir "$dir.bak"
-            Install-Clone $url $dir
+            Install-Clone $url $dir $tag
         } else {
             Write-Host "[SKIP]     $name installed but not a git checkout (use -Force to replace)"
             $skip++
+        }
+        continue
+    }
+
+    # Pinned library: must be at the tag's commit, whatever branch or release it was cloned from.
+    if ($tag) {
+        $tagRev = Invoke-Git -C $dir rev-parse -q --verify "refs/tags/$tag^{commit}"
+        if ($tagRev -and $tagRev -eq (Invoke-Git -C $dir rev-parse HEAD)) {
+            Write-Host "[OK]       $name is at $tag"; $ok++
+        } elseif ($Check) {
+            Write-Host "[OUTDATED] $name is not at $tag"; $upd++
+        } elseif (Invoke-Git -C $dir status --porcelain) {
+            Write-Host "[SKIP]     $name is not at $tag but has local changes"; $skip++
+        } else {
+            Write-Host "[UPDATE]   $name -> $tag"
+            Invoke-Git -C $dir fetch --quiet --depth 1 origin "refs/tags/${tag}:refs/tags/${tag}" | Out-Null
+            if ($script:GitOk) { Invoke-Git -C $dir checkout --quiet $tag | Out-Null }
+            if ($script:GitOk) { $upd++ } else { Write-Host "           update failed"; $fail++ }
         }
         continue
     }
